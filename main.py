@@ -13,6 +13,47 @@ from backtest import update_backtests, simulate_trade_performance
 from api import check_market_events
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+
+def debug_feeds():
+    """Test parsing each feed to identify issues"""
+    logger.info("Debug mode: Testing feed parsing...")
+    
+    for feed_url in FEED_URLS:
+        try:
+            logger.info(f"Testing feed: {feed_url}")
+            feed = feedparser.parse(feed_url, timeout=15)
+            
+            # Log feed status
+            if hasattr(feed, 'status'):
+                logger.info(f"  Status: {feed.status}")
+            
+            # Log feed bozo (error flag)
+            if hasattr(feed, 'bozo') and feed.bozo:
+                logger.error(f"  Feed parse error: {feed.get('bozo_exception', 'Unknown error')}")
+            
+            # Log entry count
+            logger.info(f"  Entries: {len(feed.entries)}")
+            
+            # Test first entry if available
+            if feed.entries:
+                entry = feed.entries[0]
+                logger.info(f"  First entry title: {entry.get('title', 'No title')}")
+                logger.info(f"  First entry date fields: {[k for k in entry.keys() if 'date' in k.lower() or 'time' in k.lower() or 'pub' in k.lower()]}")
+                
+                if 'pubDate' in entry:
+                    logger.info(f"  pubDate: {entry.pubDate}")
+                
+                # Test is_recent function
+                is_rec = is_recent(entry)
+                logger.info(f"  is_recent result: {is_rec}")
+            else:
+                logger.warning(f"  No entries found in feed")
+        
+        except Exception as e:
+            logger.error(f"Error testing feed {feed_url}: {e}", exc_info=True)
+    
+    logger.info("Feed testing complete")
+
 # Removed local ENABLE_BACKTESTING definition - use the one from config.py instead
 def check_feeds_availability():
     """Check if the RSS feeds are available and contain entries"""
@@ -290,6 +331,7 @@ def run_maintenance_tasks():
 def main():
     """Main entry point for the trading system"""
     logger.info("Starting multi-factor newsfeed trading system...")
+    debug_feeds()
     check_feeds_availability()
 
     # Ensure directories exist

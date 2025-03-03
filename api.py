@@ -58,6 +58,7 @@ def clean_response_text(response_text: str) -> str:
         logger.error(f"Error in clean_response_text: {e}")
         raise
 
+# REMOVED lru_cache decorator to fix unhashable list error
 def robust_api_call(models, prompt, config=None, max_tokens=4000, thinking_budget=None, retries=3, initial_delay=2):
     if isinstance(models, str):
         models = [models]
@@ -273,31 +274,26 @@ def check_market_events(model):
         logger.warning(f"Failed to use Google Search grounding for market events: {e}")
     
     # Fallback to standard call
-    success, response = robust_api_call([model], prompt)
-    if success:
-        if isinstance(response, dict):
+    try:
+        success, response = robust_api_call([model], prompt)
+        if success:
             events = response.get('events', [])
             # Ensure events is a list
             if not isinstance(events, list):
                 events = [str(events)] if events else []
             market_risk = response.get('market_risk', 'low')
-        elif isinstance(response, list):
-            # If response is a list, use it as events
-            logger.warning("Response is a list instead of dict")
-            events = [str(item) for item in response]
-            market_risk = 'low'
         else:
-            logger.warning(f"Unexpected response type: {type(response)}")
-            events = []
-            market_risk = 'low'
-    else:
-        if response and isinstance(response, str):
-            parsed = parse_market_events_text(response)
-            events = parsed['events']
-            market_risk = parsed['market_risk']
-        else:
-            logger.error("Failed to get market events")
-            events = []
-            market_risk = 'low'
+            if response:
+                parsed = parse_market_events_text(response)
+                events = parsed['events']
+                market_risk = parsed['market_risk']
+            else:
+                logger.error("Failed to get market events")
+                events = []
+                market_risk = 'low'
+    except Exception as e:
+        logger.error(f"Error in market events check: {e}")
+        events = []
+        market_risk = 'low'
     
     return {'events': events, 'market_risk': market_risk}

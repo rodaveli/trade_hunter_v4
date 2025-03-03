@@ -112,48 +112,66 @@ def update_watchlist_performance(get_current_price_func=None):
 
 def is_recent(entry):
     """
-    Check if an RSS feed entry is recent (within the last 24 hours).
+    Check if an RSS feed entry is recent (within the last 48 hours).
     Handles various date formats and missing date information.
     """
-    # Debug information
     logger.debug(f"Checking recency for entry: {entry.get('title', 'Unknown')}")
     
-    # If no published_parsed, check alternative date fields
-    if 'published_parsed' not in entry:
-        # Try alternative date fields
-        for field in ['updated_parsed', 'created_parsed', 'pubDate']:
-            if field in entry:
-                try:
-                    if field == 'pubDate':
-                        # Parse string date format
-                        from email.utils import parsedate_to_datetime
-                        publish_time = parsedate_to_datetime(entry[field])
-                    else:
-                        # Parse tuple format
-                        publish_time = datetime.datetime(*entry[field][:6])
-                    
-                    age_seconds = (datetime.datetime.now() - publish_time).total_seconds()
-                    logger.debug(f"Using {field}, age: {age_seconds/3600:.1f} hours")
-                    return age_seconds <= 86400  # 24 hours
-                except Exception as e:
-                    logger.debug(f"Failed to parse {field}: {e}")
-        
-        # If we couldn't find a date, assume it's recent
-        logger.info(f"No date information found for: {entry.get('title', 'Unknown')}, assuming recent")
-        return True
+    # Try to find a date field in the entry
+    date_fields = ['published_parsed', 'updated_parsed', 'pubDate']
     
-    try:
-        # Standard case with published_parsed
-        publish_time = datetime.datetime(*entry.published_parsed[:6])
-        age_seconds = (datetime.datetime.now() - publish_time).total_seconds()
-        
-        # Handle potential timezone issues
-        if age_seconds < 0:
-            logger.warning(f"Article appears to be in the future, assuming recent: {entry.get('title', 'Unknown')}")
-            return True
-            
-        logger.debug(f"Entry age: {age_seconds/3600:.1f} hours, recent: {age_seconds <= 86400}")
-        return age_seconds <= 86400  # 24 hours
-    except Exception as e:
-        logger.warning(f"Error determining if entry is recent: {e}, assuming recent")
-        return True
+    for field in date_fields:
+        if field in entry:
+            try:
+                if field == 'pubDate':
+                    # Handle string date formats
+                    from email.utils import parsedate_to_datetime
+                    try:
+                        # Standard RFC822 format
+                        publish_time = parsedate_to_datetime(entry[field])
+                    except (ValueError, TypeError):
+                        # Try custom parsing for other formats
+                        date_str = entry[field]
+                        if 'UT' in date_str:  # Business Wire format
+                            date_str = date_str.replace('UT', 'GMT')
+                        try:
+                            publish_time = datetime.datetime.strptime(date_str, '%a, %d %b %Y %H:%M:%S %Z')
+                        except ValueError:
+                            # Try more formats if needed
+                            formats = [
+                                '%a, %d %b %Y %H:%M:%S %z',
+                                '%Y-%m-%dT%H:%M:%S%z',
+                                '%Y-%m-%d %H:%M:%S'
+                            ]
+                            for fmt in formats:
+                                try:
+                                    publish_time = datetime.datetime.strptime(date_str, fmt)
+                                    break
+                                except ValueError:
+                                    continue
+                            else:
+                                logger.warning(f"Could not parse date: {date_str}")
+                                return True  # Assume recent if we can't parse
+                else:
+                    # Handle tuple format
+                    publish_time = datetime.datetime(*entry[field][:6])
+                
+                # Calculate age
+                age_seconds = (datetime.datetime.now() - publish_time).total_seconds()
+                
+                # Handle timezone issues (negative age)
+                if age_seconds < 0:
+                    logger.warning(f"Entry appears to be in the future: {entry.get('title', 'Unknown')}")
+                    return True
+                
+                # Consider entries from the last 48 hours as recent (increased from 24 to be safe)
+                logger.debug(f"Entry age: {age_seconds/3600:.1f} hours")
+                return age_seconds <= 172800  # 48 hours
+                
+            except Exception as e:
+                logger.warning(f"Error parsing date for {field}: {e}")
+                # Continue to try other date fields
+    
+    # If we get here, we couldn't find or parse any date field
+    logger.info(f"No valid date information found for: {entry.get('title', 'Unknown')}, assuming recent")
+    return True  # Assume recent if we can't determine the date
