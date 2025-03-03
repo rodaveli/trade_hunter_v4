@@ -262,8 +262,11 @@ def check_market_events(model):
         }
         
         success, response = robust_api_call([model], prompt, google_search_config)
-        if success:
+        if success and isinstance(response, dict):
             events = response.get('events', [])
+            # Ensure events is a list
+            if not isinstance(events, list):
+                events = [str(events)] if events else []
             market_risk = response.get('market_risk', 'low')
             logger.info(f"Market events check completed with Google Search grounding: {len(events)} events, risk: {market_risk}")
             return {'events': events, 'market_risk': market_risk}
@@ -273,10 +276,23 @@ def check_market_events(model):
     # Fallback to standard call
     success, response = robust_api_call([model], prompt)
     if success:
-        events = response.get('events', [])
-        market_risk = response.get('market_risk', 'low')
+        if isinstance(response, dict):
+            events = response.get('events', [])
+            # Ensure events is a list
+            if not isinstance(events, list):
+                events = [str(events)] if events else []
+            market_risk = response.get('market_risk', 'low')
+        elif isinstance(response, list):
+            # If response is a list, use it as events
+            logger.warning("Response is a list instead of dict")
+            events = [str(item) for item in response]
+            market_risk = 'low'
+        else:
+            logger.warning(f"Unexpected response type: {type(response)}")
+            events = []
+            market_risk = 'low'
     else:
-        if response:
+        if response and isinstance(response, str):
             parsed = parse_market_events_text(response)
             events = parsed['events']
             market_risk = parsed['market_risk']

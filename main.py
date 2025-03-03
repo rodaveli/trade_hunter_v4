@@ -22,31 +22,51 @@ def process_feed(processed_articles, daily_stats, run_timestamp):
         logger.info(f"Processing feed: {feed_url}")
         try:
             feed = feedparser.parse(feed_url)
+            if not feed.entries:
+                logger.warning(f"No entries found in feed: {feed_url}")
+                continue
+                
+            logger.info(f"Found {len(feed.entries)} entries in feed: {feed_url}")
             new_articles_found = False
+            
             for entry in feed.entries:
+                entry_title = entry.get("title", "No title")
+                logger.debug(f"Checking entry: {entry_title[:50]}...")
+                
                 if not is_recent(entry):
+                    logger.debug(f"Entry not recent: {entry_title[:50]}...")
                     continue
+                    
+                logger.debug(f"Entry is recent: {entry_title[:50]}...")
+                
                 entry_id = entry.get("id", entry.get("link", entry.get("title")))
                 if entry_id in processed_articles:
+                    logger.debug(f"Entry already processed: {entry_title[:50]}...")
                     continue
+                    
                 processed_articles.add(entry_id)
                 headline = entry.get("title", "").strip()
                 summary = entry.get("summary", "").strip()
                 full_text = fetch_full_text(entry)
+                
                 if headline:
                     batch_items.append({"headline": headline, "summary": summary, "full_text": full_text})
                     new_articles_found = True
+                    logger.info(f"Added to batch: {headline[:50]}...")
+                
                 if len(batch_items) >= BATCH_SIZE:
                     process_batch(batch_items, today_str, run_timestamp, processed_articles, daily_stats)
                     batch_items = []
+            
             if batch_items:
                 process_batch(batch_items, today_str, run_timestamp, processed_articles, daily_stats)
                 batch_items = []
+                
             save_processed_articles(processed_articles)
             save_daily_stats(daily_stats)
             logger.info(f"{'New articles found' if new_articles_found else 'No new recent articles'} in {feed_url}")
         except Exception as e:
-            logger.error(f"Error processing feed {feed_url}: {e}")
+            logger.error(f"Error processing feed {feed_url}: {e}", exc_info=True)
 
 def process_batch(items, today_str, run_timestamp, processed_articles, daily_stats):
     """Process a batch of news items"""
@@ -168,27 +188,39 @@ def run_maintenance_tasks():
     """Run periodic maintenance tasks"""
     try:
         # Update performance of stocks in watchlist
+        logger.info("Starting watchlist performance update")
         update_watchlist_performance()
         
         # Update backtests if enabled
         if ENABLE_BACKTESTING:
+            logger.info("Starting backtest update")
             update_backtests()
         
         # Check for significant market events
-        events_info = check_market_events(MODEL_THINKING)
-        market_risk = events_info['market_risk']
-        
-        # Adjust trading threshold if market risk is elevated
-        if market_risk in ['medium', 'high']:
-            for event in events_info['events']:
-                logger.warning(f"Market event detected: {event}")
+        logger.info("Starting market events check")
+        try:
+            events_info = check_market_events(MODEL_THINKING)
+            
+            # Validate the response
+            if not isinstance(events_info, dict):
+                logger.error(f"Invalid market events response: {type(events_info)}")
+                events_info = {'events': [], 'market_risk': 'low'}
                 
-            if market_risk == 'high':
-                global MIN_OVERALL_SCORE
-                MIN_OVERALL_SCORE = min(8.0, MIN_OVERALL_SCORE + 1.0)
-                logger.warning(f"Increased trading threshold to {MIN_OVERALL_SCORE} due to high market risk")
+            market_risk = events_info.get('market_risk', 'low')
+            
+            # Adjust trading threshold if market risk is elevated
+            if market_risk in ['medium', 'high']:
+                for event in events_info.get('events', []):
+                    logger.warning(f"Market event detected: {event}")
+                    
+                if market_risk == 'high':
+                    global MIN_OVERALL_SCORE
+                    MIN_OVERALL_SCORE = min(8.0, MIN_OVERALL_SCORE + 1.0)
+                    logger.warning(f"Increased trading threshold to {MIN_OVERALL_SCORE} due to high market risk")
+        except Exception as e:
+            logger.error(f"Error in market events check: {e}", exc_info=True)
     except Exception as e:
-        logger.error(f"Error running maintenance tasks: {e}")
+        logger.error(f"Error running maintenance tasks: {e}", exc_info=True)
 
 def main():
     """Main entry point for the trading system"""

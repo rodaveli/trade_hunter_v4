@@ -111,7 +111,49 @@ def update_watchlist_performance(get_current_price_func=None):
         logger.info("Updated watchlist performance metrics")
 
 def is_recent(entry):
+    """
+    Check if an RSS feed entry is recent (within the last 24 hours).
+    Handles various date formats and missing date information.
+    """
+    # Debug information
+    logger.debug(f"Checking recency for entry: {entry.get('title', 'Unknown')}")
+    
+    # If no published_parsed, check alternative date fields
     if 'published_parsed' not in entry:
+        # Try alternative date fields
+        for field in ['updated_parsed', 'created_parsed', 'pubDate']:
+            if field in entry:
+                try:
+                    if field == 'pubDate':
+                        # Parse string date format
+                        from email.utils import parsedate_to_datetime
+                        publish_time = parsedate_to_datetime(entry[field])
+                    else:
+                        # Parse tuple format
+                        publish_time = datetime.datetime(*entry[field][:6])
+                    
+                    age_seconds = (datetime.datetime.now() - publish_time).total_seconds()
+                    logger.debug(f"Using {field}, age: {age_seconds/3600:.1f} hours")
+                    return age_seconds <= 86400  # 24 hours
+                except Exception as e:
+                    logger.debug(f"Failed to parse {field}: {e}")
+        
+        # If we couldn't find a date, assume it's recent
+        logger.info(f"No date information found for: {entry.get('title', 'Unknown')}, assuming recent")
         return True
-    publish_time = datetime.datetime(*entry.published_parsed[:6])
-    return (datetime.datetime.now() - publish_time).total_seconds() <= 86400
+    
+    try:
+        # Standard case with published_parsed
+        publish_time = datetime.datetime(*entry.published_parsed[:6])
+        age_seconds = (datetime.datetime.now() - publish_time).total_seconds()
+        
+        # Handle potential timezone issues
+        if age_seconds < 0:
+            logger.warning(f"Article appears to be in the future, assuming recent: {entry.get('title', 'Unknown')}")
+            return True
+            
+        logger.debug(f"Entry age: {age_seconds/3600:.1f} hours, recent: {age_seconds <= 86400}")
+        return age_seconds <= 86400  # 24 hours
+    except Exception as e:
+        logger.warning(f"Error determining if entry is recent: {e}, assuming recent")
+        return True
