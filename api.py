@@ -58,7 +58,6 @@ def clean_response_text(response_text: str) -> str:
         logger.error(f"Error in clean_response_text: {e}")
         raise
 
-@lru_cache(maxsize=1000)
 def robust_api_call(models, prompt, config=None, max_tokens=4000, thinking_budget=None, retries=3, initial_delay=2):
     if isinstance(models, str):
         models = [models]

@@ -14,6 +14,57 @@ from api import check_market_events
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Removed local ENABLE_BACKTESTING definition - use the one from config.py instead
+def check_feeds_availability():
+    """Check if the RSS feeds are available and contain entries"""
+    import requests
+    from bs4 import BeautifulSoup
+    
+    logger.info("Checking feed availability...")
+    
+    for feed_url in FEED_URLS:
+        try:
+            # First, check if the URL is accessible
+            response = requests.get(feed_url, timeout=10)
+            
+            if response.status_code != 200:
+                logger.error(f"Feed URL returned status code {response.status_code}: {feed_url}")
+                continue
+                
+            # Check the content
+            content_length = len(response.content)
+            logger.info(f"Feed URL accessible, content length: {content_length} bytes: {feed_url}")
+            
+            # Parse the raw content (bypass feedparser for testing)
+            soup = BeautifulSoup(response.content, 'xml')
+            items = soup.find_all(['item', 'entry'])
+            
+            if items:
+                logger.info(f"Found {len(items)} raw items in feed: {feed_url}")
+                # Print a sample title if available
+                for item in items[:1]:
+                    title_tag = item.find(['title'])
+                    if title_tag:
+                        logger.info(f"Sample title: {title_tag.text}")
+            else:
+                logger.warning(f"No items found in raw feed content: {feed_url}")
+                
+            # Try with feedparser
+            parsed = feedparser.parse(feed_url)
+            
+            # Debug the entire feedparser output for the first feed
+            if feed_url == FEED_URLS[0]:
+                import pprint
+                with open("feed_debug.txt", "w") as f:
+                    f.write(pprint.pformat(parsed))
+                logger.info(f"Wrote complete debug info for first feed to feed_debug.txt")
+                
+            if parsed.entries:
+                logger.info(f"Feedparser found {len(parsed.entries)} entries in feed: {feed_url}")
+            else:
+                logger.warning(f"Feedparser found no entries in feed: {feed_url}")
+                
+        except Exception as e:
+            logger.error(f"Error checking feed {feed_url}: {e}")
 
 def process_feed(processed_articles, daily_stats, run_timestamp):
     today_str = datetime.date.today().isoformat()
@@ -21,15 +72,29 @@ def process_feed(processed_articles, daily_stats, run_timestamp):
     for feed_url in FEED_URLS:
         logger.info(f"Processing feed: {feed_url}")
         try:
-            feed = feedparser.parse(feed_url)
+            # Add timeout to feedparser call
+            feed = feedparser.parse(feed_url, timeout=10)
+            
+            # Check for feedparser errors
+            if hasattr(feed, 'bozo') and feed.bozo:
+                logger.error(f"Feed parse error: {feed.get('bozo_exception', 'Unknown error')}")
+            
             if not feed.entries:
                 logger.warning(f"No entries found in feed: {feed_url}")
+                # Log feed structure to help diagnose
+                logger.debug(f"Feed structure: {feed.keys()}")
+                if 'feed' in feed:
+                    logger.debug(f"Feed title: {feed.feed.get('title', 'No title')}")
                 continue
                 
             logger.info(f"Found {len(feed.entries)} entries in feed: {feed_url}")
             new_articles_found = False
             
             for entry in feed.entries:
+                # Log entry structure for debugging
+                if feed.entries.index(entry) == 0:
+                    logger.debug(f"First entry keys: {entry.keys()}")
+                
                 entry_title = entry.get("title", "No title")
                 logger.debug(f"Checking entry: {entry_title[:50]}...")
                 
@@ -225,7 +290,8 @@ def run_maintenance_tasks():
 def main():
     """Main entry point for the trading system"""
     logger.info("Starting multi-factor newsfeed trading system...")
-    
+    check_feeds_availability()
+
     # Ensure directories exist
     os.makedirs(RECOMMENDATIONS_DIR, exist_ok=True)
     os.makedirs(os.path.join(RECOMMENDATIONS_DIR, "by_ticker"), exist_ok=True)
