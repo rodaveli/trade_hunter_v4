@@ -59,25 +59,78 @@ def batch_analyze_headlines(items, model=MODEL_JSON):
     return {}
 
 def get_ticker_symbol(headline: str, analysis_text: str, model=MODEL_TICKER) -> str:
-    prompt = (
-        f"Extract the stock ticker symbol from the following headline and analysis. "
-        f"Return only a JSON object with the key 'ticker' and the value as the ticker symbol. "
-        f"If no ticker is found, return {{'ticker': null}}.\n\n"
-        f"Headline: {headline}\nAnalysis: {analysis_text}"
-    )
-    config = {'response_mime_type': 'application/json'}
-    success, response = robust_api_call([model], prompt, config)
-    if success and 'ticker' in response:
-        ticker = response['ticker']
-        if ticker is not None:
-            ticker = str(ticker).strip()
-            if ticker and is_valid_ticker(ticker):
-                logger.info(f"Verified ticker: {ticker}")
+    """
+    Extract the stock ticker symbol from a headline and analysis using Google Gemini with grounding.
+    
+    Args:
+        headline: The news headline
+        analysis_text: Additional analysis text that might contain company information
+        model: The model to use for extraction (default is MODEL_TICKER from config)
+        
+    Returns:
+        A valid ticker symbol or None if no valid ticker is found
+    """
+    try:
+        # First attempt with Google Search grounding
+        prompt = (
+            f"TASK: Extract the stock ticker symbol from the following headline and analysis.\n\n"
+            f"HEADLINE: {headline}\n\n"
+            f"ANALYSIS: {analysis_text}\n\n"
+            f"INSTRUCTIONS:\n"
+            f"1. Identify the public company or companies mentioned in the headline or analysis\n"
+            f"2. Return ONLY the most relevant stock ticker symbol as a JSON object with key 'ticker'\n"
+            f"3. If multiple companies are mentioned, choose the main subject of the headline\n"
+            f"4. If no ticker can be confidently determined, return {{'ticker': null}}\n"
+            f"5. Do NOT include any explanation, just return the JSON object\n"
+            f"6. Only include standard US stock tickers (NYSE, NASDAQ, etc.)\n"
+            f"7. If the ticker is uncertain, use Google Search to verify it\n\n"
+            f"RESPONSE FORMAT: {{'ticker': 'SYMBOL'}} or {{'ticker': null}} if no ticker found"
+        )
+        
+        # Configure Google Search as a tool as shown in the documentation
+        google_search_config = {
+            'response_mime_type': 'application/json',
+            'tools': [{'google_search': {}}]
+        }
+        
+        # Try with search grounding first
+        success, response = robust_api_call([model], prompt, google_search_config)
+        
+        if success and isinstance(response, dict) and 'ticker' in response:
+            ticker = response['ticker']
+            if ticker_is_valid(ticker):
+                logger.info(f"Found and verified ticker (with grounding): {ticker}")
                 return ticker
-        logger.info(f"No ticker found for '{headline}'.")
-    else:
-        logger.error(f"Failed to get ticker for '{headline}'")
-    return None
+        
+        # Fall back to standard prompt if grounding doesn't work
+        config = {'response_mime_type': 'application/json'}
+        success, response = robust_api_call([model], prompt, config)
+        
+        if success and isinstance(response, dict) and 'ticker' in response:
+            ticker = response['ticker']
+            if ticker_is_valid(ticker):
+                logger.info(f"Found and verified ticker: {ticker}")
+                return ticker
+            
+        logger.info(f"No valid ticker found for headline: '{headline}'")
+        return None
+    except Exception as e:
+        logger.error(f"Error extracting ticker symbol: {e}")
+        return None
+
+def ticker_is_valid(ticker):
+    """Helper function to validate a ticker symbol"""
+    if ticker is None:
+        return False
+        
+    ticker = str(ticker).strip().upper()
+    
+    # Quick validation checks
+    if not ticker or len(ticker) > 5 or not ticker.isalnum():
+        return False
+    
+    # Validate ticker using yfinance
+    return is_valid_ticker(ticker)
 
 def analyze_company_context(ticker, headline, analysis_text, fundamentals):
     try:
@@ -296,3 +349,15 @@ def calculate_pivot_points(df):
     except Exception as e:
         logger.error(f"Error calculating pivot points: {e}")
         return {}
+
+def detect_unusual_options_activity(ticker):
+    """
+    Detect unusual options activity for a given ticker symbol.
+    This function should be implemented based on your requirements.
+    """
+    # Implementation would go here
+    return {
+        'unusual_score': 0,
+        'assessment': 'No unusual options activity detected',
+        'unusual_activity': []
+    }
