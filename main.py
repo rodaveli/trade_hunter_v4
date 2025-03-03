@@ -4,7 +4,7 @@ import sys
 import os
 import datetime
 import feedparser
-from config import FEED_URLS, SINGLE_RUN_MODE, RECOMMENDATIONS_DIR, BACKTEST_DIR, PARALLELISM, MIN_OVERALL_SCORE, MODEL_THINKING, logger, BATCH_SIZE
+from config import FEED_URLS, SINGLE_RUN_MODE, RECOMMENDATIONS_DIR, BACKTEST_DIR, PARALLELISM, MIN_OVERALL_SCORE, MODEL_THINKING, logger, BATCH_SIZE, ENABLE_BACKTESTING
 from utils import load_processed_articles, save_processed_articles, load_daily_stats, save_daily_stats, update_watchlist_performance, is_recent
 from data import fetch_full_text
 from analysis import batch_generic_check, batch_analyze_headlines, get_ticker_symbol, analyze_company_context, is_valid_ticker
@@ -13,7 +13,7 @@ from backtest import update_backtests, simulate_trade_performance
 from api import check_market_events
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-ENABLE_BACKTESTING = False
+# Removed local ENABLE_BACKTESTING definition - use the one from config.py instead
 
 def process_feed(processed_articles, daily_stats, run_timestamp):
     today_str = datetime.date.today().isoformat()

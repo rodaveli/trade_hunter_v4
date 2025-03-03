@@ -1,6 +1,7 @@
 import json
 import os
 import datetime
+import re
 from config import BACKTEST_DIR, ENABLE_BACKTESTING, logger
 from data import get_current_price
 
@@ -29,15 +30,22 @@ def simulate_trade_performance(ticker, strategy, days_to_monitor=10):
             'hit_target': False,
             'hit_stop': False
         }
+        
+        # Improved price extraction with regex
         try:
             target_text = strategy.get('target', '')
-            if '$' in target_text:
-                backtest_record['target_price'] = float(target_text.split('$')[1].split(' ')[0])
+            target_match = re.search(r'\$(\d+\.\d+)', target_text)
+            if target_match:
+                backtest_record['target_price'] = float(target_match.group(1))
+                
             stop_text = strategy.get('stop_loss', '')
-            if '$' in stop_text:
-                backtest_record['stop_price'] = float(stop_text.split('$')[1].split(' ')[0])
-        except (IndexError, ValueError) as e:
+            stop_match = re.search(r'\$(\d+\.\d+)', stop_text)
+            if stop_match:
+                backtest_record['stop_price'] = float(stop_match.group(1))
+                
+        except (ValueError, AttributeError) as e:
             logger.warning(f"Could not parse target/stop prices for {ticker}: {e}")
+            
         backtest_file = os.path.join(BACKTEST_DIR, f"{ticker}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
         with open(backtest_file, "w") as f:
             json.dump(backtest_record, f, indent=4)

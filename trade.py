@@ -1,6 +1,7 @@
 import os
 import json
 import datetime
+import re
 import yfinance as yf
 from api import robust_api_call
 from config import RECOMMENDATIONS_DIR, MIN_OVERALL_SCORE, ENABLE_BACKTESTING, logger
@@ -203,18 +204,29 @@ def generate_trade_strategy(ticker, tech_analysis, options_activity, news_analys
 def generate_risk_reward_chart(ticker, strategy, run_timestamp):
     try:
         entry = strategy.get('entry', '')
-        if not entry or '$' not in entry:
+        
+        # Improved price extraction with regex
+        current_price_match = re.search(r'\$(\d+\.\d+)', entry)
+        if not current_price_match:
             logger.warning(f"No valid entry price found for {ticker}")
             return
-        current_price = float(entry.split('$')[1].split(' ')[0])
-        target_price = float(strategy.get('target', '').split('$')[1].split(' ')[0]) if '$' in strategy.get('target', '') else None
-        stop_price = float(strategy.get('stop_loss', '').split('$')[1].split(' ')[0]) if '$' in strategy.get('stop_loss', '') else None
-        if not target_price or not stop_price:
+            
+        current_price = float(current_price_match.group(1))
+        
+        target_match = re.search(r'\$(\d+\.\d+)', strategy.get('target', ''))
+        stop_match = re.search(r'\$(\d+\.\d+)', strategy.get('stop_loss', ''))
+        
+        if not target_match or not stop_match:
             logger.warning(f"Missing target or stop price for {ticker}")
             return
+            
+        target_price = float(target_match.group(1))
+        stop_price = float(stop_match.group(1))
+        
         potential_gain = abs(target_price - current_price) / current_price * 100
         potential_loss = abs(stop_price - current_price) / current_price * 100
         risk_reward = potential_gain / potential_loss if potential_loss > 0 else 0
+        
         chart_data = {
             'ticker': ticker,
             'current_price': current_price,
@@ -225,9 +237,14 @@ def generate_risk_reward_chart(ticker, strategy, run_timestamp):
             'risk_reward_ratio': risk_reward,
             'strategy_type': strategy.get('type', 'unknown')
         }
+        
+        # Ensure directory exists
+        os.makedirs(os.path.join(RECOMMENDATIONS_DIR, run_timestamp), exist_ok=True)
+        
         chart_file = os.path.join(RECOMMENDATIONS_DIR, run_timestamp, f"{ticker}_risk_reward.json")
         with open(chart_file, "w") as f:
             json.dump(chart_data, f, indent=4)
+            
     except Exception as e:
         logger.error(f"Error generating risk/reward chart for {ticker}: {e}")
 

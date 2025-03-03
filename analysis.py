@@ -98,7 +98,7 @@ def get_ticker_symbol(headline: str, analysis_text: str, model=MODEL_TICKER) -> 
         
         if success and isinstance(response, dict) and 'ticker' in response:
             ticker = response['ticker']
-            if ticker_is_valid(ticker):
+            if is_valid_ticker(ticker):  # FIXED: Use is_valid_ticker instead of ticker_is_valid
                 logger.info(f"Found and verified ticker (with grounding): {ticker}")
                 return ticker
         
@@ -108,7 +108,7 @@ def get_ticker_symbol(headline: str, analysis_text: str, model=MODEL_TICKER) -> 
         
         if success and isinstance(response, dict) and 'ticker' in response:
             ticker = response['ticker']
-            if ticker_is_valid(ticker):
+            if is_valid_ticker(ticker):  # FIXED: Use is_valid_ticker instead of ticker_is_valid
                 logger.info(f"Found and verified ticker: {ticker}")
                 return ticker
             
@@ -118,19 +118,20 @@ def get_ticker_symbol(headline: str, analysis_text: str, model=MODEL_TICKER) -> 
         logger.error(f"Error extracting ticker symbol: {e}")
         return None
 
-def ticker_is_valid(ticker):
-    """Helper function to validate a ticker symbol"""
-    if ticker is None:
-        return False
-        
-    ticker = str(ticker).strip().upper()
-    
-    # Quick validation checks
-    if not ticker or len(ticker) > 5 or not ticker.isalnum():
-        return False
-    
-    # Validate ticker using yfinance
-    return is_valid_ticker(ticker)
+# This function is no longer needed since we're using is_valid_ticker
+# def ticker_is_valid(ticker):
+#     """Helper function to validate a ticker symbol"""
+#     if ticker is None:
+#         return False
+#         
+#     ticker = str(ticker).strip().upper()
+#     
+#     # Quick validation checks
+#     if not ticker or len(ticker) > 5 or not ticker.isalnum():
+#         return False
+#     
+#     # Validate ticker using yfinance
+#     return is_valid_ticker(ticker)
 
 def analyze_company_context(ticker, headline, analysis_text, fundamentals):
     try:
