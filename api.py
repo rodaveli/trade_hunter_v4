@@ -134,15 +134,60 @@ def robust_api_call(models, prompt, config=None, max_tokens=4000, thinking_budge
                 else:
                     check_rate_limits(model)
                     daily_request_counts[model] += 1
+                    
+                    # Check if config contains Google Search tool
+                    has_search_tool = False
+                    if config and 'tools' in config:
+                        for tool in config['tools']:
+                            if 'google_search' in tool:
+                                has_search_tool = True
+                                break
+                    
+                    # Process the config for Gemini API
+                    gemini_config = None
                     if config:
-                        response = client.models.generate_content(model=model, contents=prompt, config=config)
+                        gemini_config = {}
+                        if 'response_mime_type' in config:
+                            gemini_config['response_mime_type'] = config['response_mime_type']
+                        
+                        # Handle Google Search as a tool
+                        if has_search_tool:
+                            from google.genai.types import Tool, GoogleSearch
+                            tools = []
+                            for tool_config in config['tools']:
+                                if 'google_search' in tool_config:
+                                    tools.append(Tool(google_search=GoogleSearch()))
+                            if tools:
+                                gemini_config['tools'] = tools
+                        
+                        # Copy other configs if needed
+                        if 'response_modalities' in config:
+                            gemini_config['response_modalities'] = config['response_modalities']
+                    
+                    # Generate content with appropriate config
+                    if gemini_config:
+                        from google.genai.types import GenerateContentConfig
+                        generate_config = GenerateContentConfig(**gemini_config)
+                        response = client.models.generate_content(model=model, contents=prompt, config=generate_config)
                     else:
                         response = client.models.generate_content(model=model, contents=prompt)
+                    
+                    # Process grounding metadata if available
+                    if hasattr(response, 'candidates') and response.candidates:
+                        candidate = response.candidates[0]
+                        if hasattr(candidate, 'grounding_metadata') and candidate.grounding_metadata:
+                            logger.info(f"Response includes grounding metadata from Google Search")
+                    
                     response_text = clean_response_text(response.text)
-                    parsed = json.loads(response_text)
-                    if hasattr(response, 'usage_metadata'):
-                        logger.info(f"Used {response.usage_metadata.total_token_count} tokens for {model}")
-                    return True, parsed
+                    try:
+                        parsed = json.loads(response_text)
+                        if hasattr(response, 'usage_metadata'):
+                            logger.info(f"Used {response.usage_metadata.total_token_count} tokens for {model}")
+                        return True, parsed
+                    except json.JSONDecodeError:
+                        if 'response_mime_type' in config and config['response_mime_type'] == 'application/json':
+                            logger.error(f"Gemini returned invalid JSON: {response_text}")
+                        return False, response_text
             except Exception as e:
                 logger.error(f"Attempt {attempt + 1} failed for {model}: {e}")
                 if attempt < retries - 1:
@@ -167,6 +212,7 @@ def robust_api_call(models, prompt, config=None, max_tokens=4000, thinking_budge
         return False, None
 
 def parse_market_events_text(text):
+    """Parse market events text when JSON parsing fails"""
     events = []
     market_risk = 'low'
     lines = text.split('\n')
@@ -188,6 +234,16 @@ def parse_market_events_text(text):
     return {'events': events, 'market_risk': market_risk}
 
 def check_market_events(model):
+    """
+    Check for significant market-moving events in the past 24 hours.
+    Uses Google Search grounding when available for more accurate and up-to-date information.
+    
+    Args:
+        model: The model to use for market event detection
+        
+    Returns:
+        Dict with 'events' (list of strings) and 'market_risk' (string)
+    """
     prompt = (
         "What are the most significant market-moving events in the past 24 hours? "
         "Focus on Fed announcements, economic data releases, geopolitical events, "
@@ -195,6 +251,26 @@ def check_market_events(model):
         "Rate the market risk as low, medium, or high. "
         "Please provide the response in JSON format with keys 'events' (list of strings) and 'market_risk' (string)."
     )
+    
+    # Try with Google Search grounding first
+    try:
+        from google.genai.types import Tool, GoogleSearch
+        google_search_config = {
+            'response_mime_type': 'application/json',
+            'tools': [{'google_search': {}}],
+            'response_modalities': ["TEXT"],
+        }
+        
+        success, response = robust_api_call([model], prompt, google_search_config)
+        if success:
+            events = response.get('events', [])
+            market_risk = response.get('market_risk', 'low')
+            logger.info(f"Market events check completed with Google Search grounding: {len(events)} events, risk: {market_risk}")
+            return {'events': events, 'market_risk': market_risk}
+    except Exception as e:
+        logger.warning(f"Failed to use Google Search grounding for market events: {e}")
+    
+    # Fallback to standard call
     success, response = robust_api_call([model], prompt)
     if success:
         events = response.get('events', [])
@@ -208,4 +284,5 @@ def check_market_events(model):
             logger.error("Failed to get market events")
             events = []
             market_risk = 'low'
+    
     return {'events': events, 'market_risk': market_risk}

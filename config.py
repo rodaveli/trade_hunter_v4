@@ -34,12 +34,17 @@ DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')
 if not DEEPSEEK_API_KEY:
     logger.warning("DEEPSEEK_API_KEY environment variable is not set")
 
+# Model Configuration
 USE_SONNET_FOR_THINKING = True
 MODEL_ANALYSIS = "gemini-2.0-flash"
-MODEL_THINKING = "claude-3-7-sonnet-20250219" if USE_SONNET_FOR_THINKING else "gemini-2.0-flash-thinking-exp-01-21"
-MODEL_TICKER = "gemini-2.0-flash"
+MODEL_THINKING = "claude-3-7-sonnet-20250219" if USE_SONNET_FOR_THINKING else "gemini-2.0-flash"
+MODEL_TICKER = "gemini-2.0-flash"  # Using Gemini 2.0 Flash for ticker extraction with grounding
 MODEL_JSON = MODEL_ANALYSIS
 
+# Single run mode flag (for command-line control)
+SINGLE_RUN_MODE = len(os.sys.argv) > 1 and os.sys.argv[1] == "--single-run"
+
+# Initialize API clients
 client = genai.Client(api_key=GEMINI_API_KEY)
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 deepseek_client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com") if DEEPSEEK_API_KEY else None
