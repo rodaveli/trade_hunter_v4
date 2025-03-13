@@ -54,10 +54,13 @@ FEED_URLS = [
     "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFpRXEMGSQ5STlFQGEZdE0RPAwoBThFNXBBdVVM=",
     "https://rss.app/feeds/_kbmkWNuMUCeQeZ29.xml",
     "https://www.prnewswire.com/rss/news-releases-list.rss",
-    "https://seekingalpha.com/market_currents.xml",
-    "https://www.benzinga.com/feed/",
+    "https://www.prnewswire.com/rss/all-news-releases-from-PR-newswire-news.rss",
+    "https://news.alphastreet.com/feed/",
     "https://www.investors.com/category/news/rss/",
-    "https://feeds.a.dj.com/rss/RSSMarketsMain.xml"
+    "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
+    "https://feeds.content.dowjones.io/public/rss/mw_topstories",
+    "https://www.investing.com/rss/news.rss",
+    "https://www.marketwatch.com/rss/news/market","https://seekingalpha.com/market_currents.xml","https://www.ino.com/blog/feed/",
 ]
 
 # Configuration Options

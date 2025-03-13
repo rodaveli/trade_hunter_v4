@@ -77,13 +77,13 @@ def get_ticker_symbol(headline: str, analysis_text: str, model=MODEL_TICKER) -> 
             f"HEADLINE: {headline}\n\n"
             f"ANALYSIS: {analysis_text}\n\n"
             f"INSTRUCTIONS:\n"
-            f"1. Identify the public company or companies mentioned in the headline or analysis\n"
-            f"2. Return ONLY the most relevant stock ticker symbol as a JSON object with key 'ticker'\n"
-            f"3. If multiple companies are mentioned, choose the main subject of the headline\n"
-            f"4. If no ticker can be confidently determined, return {{'ticker': null}}\n"
-            f"5. Do NOT include any explanation, just return the JSON object\n"
+            f"1. Identify the public company or companies mentioned in the headline or analysis.\n"
+            f"2. If a ticker symbol is explicitly mentioned, use that.\n"
+            f"3. If no ticker is mentioned but a company name is present, infer the most likely ticker symbol.\n"
+            f"4. If multiple companies are mentioned, choose the main subject of the headline.\n"
+            f"5. If no ticker can be confidently determined, return {{'ticker': null}}\n"
             f"6. Only include standard US stock tickers (NYSE, NASDAQ, etc.)\n"
-            f"7. If the ticker is uncertain, use Google Search to verify it\n\n"
+            f"7. If the ticker is uncertain, use Google Search to verify it.\n\n"
             f"RESPONSE FORMAT: {{'ticker': 'SYMBOL'}} or {{'ticker': null}} if no ticker found"
         )
         
@@ -98,7 +98,7 @@ def get_ticker_symbol(headline: str, analysis_text: str, model=MODEL_TICKER) -> 
         
         if success and isinstance(response, dict) and 'ticker' in response:
             ticker = response['ticker']
-            if is_valid_ticker(ticker):  # FIXED: Use is_valid_ticker instead of ticker_is_valid
+            if is_valid_ticker(ticker):
                 logger.info(f"Found and verified ticker (with grounding): {ticker}")
                 return ticker
         
@@ -108,7 +108,7 @@ def get_ticker_symbol(headline: str, analysis_text: str, model=MODEL_TICKER) -> 
         
         if success and isinstance(response, dict) and 'ticker' in response:
             ticker = response['ticker']
-            if is_valid_ticker(ticker):  # FIXED: Use is_valid_ticker instead of ticker_is_valid
+            if is_valid_ticker(ticker):
                 logger.info(f"Found and verified ticker: {ticker}")
                 return ticker
             
@@ -117,21 +117,6 @@ def get_ticker_symbol(headline: str, analysis_text: str, model=MODEL_TICKER) -> 
     except Exception as e:
         logger.error(f"Error extracting ticker symbol: {e}")
         return None
-
-# This function is no longer needed since we're using is_valid_ticker
-# def ticker_is_valid(ticker):
-#     """Helper function to validate a ticker symbol"""
-#     if ticker is None:
-#         return False
-#         
-#     ticker = str(ticker).strip().upper()
-#     
-#     # Quick validation checks
-#     if not ticker or len(ticker) > 5 or not ticker.isalnum():
-#         return False
-#     
-#     # Validate ticker using yfinance
-#     return is_valid_ticker(ticker)
 
 def analyze_company_context(ticker, headline, analysis_text, fundamentals):
     try:
@@ -155,16 +140,12 @@ def analyze_company_context(ticker, headline, analysis_text, fundamentals):
             f"4. Suggest a position size adjustment factor from -2 to +2 (-2 = much smaller position due to weak fundamentals, 0 = no adjustment, +2 = increase position size due to strong fundamentals)\n\n"
             f"Provide a JSON response with keys: 'relevant', 'impact_assessment', 'financial_strength', 'risk_adjustment'."
         )
-        THINKING_MODELS = [
-            "deepseek-reasoner",
-            "gemini-2.0-flash-thinking-exp-01-21",
-            "claude-3-7-sonnet-20250219"
-        ]
-        config = {'response_mime_type': 'application/json'} if "gemini" in THINKING_MODELS[0] else None
-        success, response = robust_api_call(THINKING_MODELS, prompt, config, max_tokens=4000, retries=2)
+        models = ["gemini-2.0-flash"]
+        config = {'response_mime_type': 'application/json'}
+        success, response = robust_api_call(models, prompt, config, max_tokens=4000, retries=2)
         if success:
             return response
-        logger.error("All thinking models failed for analyze_company_context")
+        logger.error("Failed to analyze company context")
         return {
             "relevant": False,
             "impact_assessment": "Failed to get valid response",
@@ -354,11 +335,50 @@ def calculate_pivot_points(df):
 def detect_unusual_options_activity(ticker):
     """
     Detect unusual options activity for a given ticker symbol.
-    This function should be implemented based on your requirements.
+    Basic implementation to analyze volume and open interest.
     """
-    # Implementation would go here
-    return {
-        'unusual_score': 0,
-        'assessment': 'No unusual options activity detected',
-        'unusual_activity': []
-    }
+    try:
+        from data import get_options_chain_data, get_cache_timestamp
+        options_data = get_options_chain_data(ticker, get_cache_timestamp())
+        if not options_data:
+            return {
+                'unusual_score': 0,
+                'assessment': 'No options data available',
+                'unusual_activity': []
+            }
+        unusual_activity = []
+        total_score = 0
+        for expiry, chain in options_data.items():
+            for option_type in ['calls', 'puts']:
+                df = pd.DataFrame(chain[option_type])
+                if df.empty or 'volume' not in df.columns or 'openInterest' not in df.columns:
+                    continue
+                df['vol_oi_ratio'] = df['volume'] / df['openInterest'].replace(0, 1)
+                unusual = df[df['vol_oi_ratio'] > 5]  # Threshold for unusual activity
+                for _, row in unusual.iterrows():
+                    unusual_activity.append({
+                        'type': option_type[:-1],  # 'call' or 'put'
+                        'strike': row['strike'],
+                        'expiration': expiry,
+                        'volume': row['volume'],
+                        'open_interest': row['openInterest'],
+                        'vol_oi_ratio': row['vol_oi_ratio']
+                    })
+                    total_score += min(row['vol_oi_ratio'] / 5, 2)  # Cap contribution per strike
+        assessment = (
+            'Significant unusual activity detected' if total_score > 3 else
+            'Moderate unusual activity' if total_score > 1 else
+            'No significant unusual options activity'
+        )
+        return {
+            'unusual_score': min(total_score, 10),  # Max score of 10
+            'assessment': assessment,
+            'unusual_activity': unusual_activity
+        }
+    except Exception as e:
+        logger.error(f"Error detecting options activity for {ticker}: {e}")
+        return {
+            'unusual_score': 0,
+            'assessment': 'Error detecting options activity',
+            'unusual_activity': []
+        }

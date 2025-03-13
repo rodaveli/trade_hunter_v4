@@ -5,11 +5,22 @@ import re
 import yfinance as yf
 from api import robust_api_call
 from config import RECOMMENDATIONS_DIR, MIN_OVERALL_SCORE, ENABLE_BACKTESTING, logger
-from data import get_current_price, get_extended_market_context
+from data import get_current_price, get_extended_market_context, get_stock_data
 from analysis import perform_technical_analysis, detect_unusual_options_activity
 from utils import add_to_watchlist
+from config import logger
 
 def evaluate_trade_opportunity(ticker, news_analysis=None):
+    """
+    Evaluates a trade opportunity for a given ticker based on technical analysis, options activity, and news.
+    
+    Args:
+        ticker (str): Stock ticker symbol.
+        news_analysis (dict, optional): Analysis of news including sentiment and confidence.
+    
+    Returns:
+        dict: Trade evaluation with scores, recommendation, and strategy if applicable.
+    """
     results = {
         'ticker': ticker,
         'timestamp': datetime.datetime.now().isoformat(),
@@ -18,6 +29,8 @@ def evaluate_trade_opportunity(ticker, news_analysis=None):
         'max_score': 10,
         'recommendation': "No Trade"
     }
+    
+    # Technical Analysis
     tech_analysis = perform_technical_analysis(ticker)
     if tech_analysis['technical_rating'] == "No Data":
         results['factors']['technical'] = {'score': 0, 'rating': "No Data", 'details': tech_analysis}
@@ -25,13 +38,24 @@ def evaluate_trade_opportunity(ticker, news_analysis=None):
     tech_score = min(5, (tech_analysis['technical_score'] / tech_analysis['max_score']) * 5)
     results['factors']['technical'] = {'score': tech_score, 'rating': tech_analysis['technical_rating'], 'details': tech_analysis}
     results['overall_score'] += tech_score
+    
+    # Options Activity
     options_activity = detect_unusual_options_activity(ticker)
     options_score = min(3, options_activity['unusual_score'] * 0.5)
     results['factors']['options_activity'] = {'score': options_score, 'assessment': options_activity['assessment'], 'details': options_activity}
     results['overall_score'] += options_score
+    
+    # News Analysis
     if news_analysis:
         news_confidence = news_analysis.get('confidence', 'low')
         news_score = {'very-high': 2.0, 'high': 1.5, 'medium': 1.0, 'low': 0.5}.get(news_confidence.lower().replace(' ', '-'), 0)
+        # Adjust news score based on market cap (favor smaller companies)
+        stock_data = get_stock_data(ticker, get_cache_timestamp())
+        market_cap = stock_data.get('marketCap', 0) / 1e9  # Convert to billions
+        if market_cap > 0 and market_cap < 1:  # Small cap (< $1B)
+            news_score *= 1.5
+        elif market_cap < 10:  # Mid cap (< $10B)
+            news_score *= 1.2
         results['factors']['news_catalyst'] = {
             'score': news_score,
             'confidence': news_confidence,
@@ -40,6 +64,8 @@ def evaluate_trade_opportunity(ticker, news_analysis=None):
             'details': news_analysis
         }
         results['overall_score'] += news_score
+    
+    # Market Context and Recommendation
     results['market_context'] = get_extended_market_context()
     results['recommendation'] = (
         "Strong Buy" if results['overall_score'] >= 7 else
@@ -47,179 +73,191 @@ def evaluate_trade_opportunity(ticker, news_analysis=None):
         "Watch" if results['overall_score'] >= 3 else
         "No Trade"
     )
+    
+    # Generate Strategy for Buy Recommendations
     if results['recommendation'] in ["Strong Buy", "Buy"]:
         use_options = options_score > 1.5 or (news_analysis and news_analysis.get('impact_timing') == 'immediate')
         results['strategy'] = generate_trade_strategy(ticker, tech_analysis, options_activity, news_analysis, results['market_context'], use_options)
+    
     return results
 
 def generate_trade_strategy(ticker, tech_analysis, options_activity, news_analysis, market_context, use_options=True):
+    """
+    Generates a trading strategy using an AI model based on technicals, options, news, and market context.
+    The model has full freedom to recommend the best strategy (or no trade), considering trader preferences as guidance.
+
+    Args:
+        ticker (str): Stock ticker symbol.
+        tech_analysis (dict): Technical analysis data.
+        options_activity (dict): Options activity data.
+        news_analysis (dict): News analysis data.
+        market_context (dict): Market context data.
+        use_options (bool): Preference for using options (default True, but model can override).
+
+    Returns:
+        dict: Trading strategy details or a "no trade" recommendation with explanation.
+    """
     try:
+        # Fetch current price
         current_price = get_current_price(ticker)
         if current_price is None:
+            logger.error(f"No current price available for {ticker}")
             return {"type": "error", "strategy": "No current price available"}
+
+        # Extract nearest support and resistance from technical analysis
         support_resistance = tech_analysis.get('support_resistance', {})
         supports = support_resistance.get('supports', [])
         resistances = support_resistance.get('resistances', [])
-        nearest_support = min(supports, key=lambda x: abs(x - current_price)) if supports else (current_price * 0.9)
-        nearest_resistance = min(resistances, key=lambda x: abs(x - current_price)) if resistances else (current_price * 1.1)
-        potential_upside = ((nearest_resistance - current_price) / current_price) * 100
-        potential_downside = ((current_price - nearest_support) / current_price) * 100
-        risk_reward = potential_upside / potential_downside if potential_downside > 0 else 0
-        sentiment = news_analysis.get('sentiment', 'neutral') if news_analysis else 'neutral'
-        sentiment_score = news_analysis.get('sentiment_score', 0) if news_analysis else 0
-        impact_timing = news_analysis.get('impact_timing', 'unknown') if news_analysis else 'unknown'
-        market_trend = market_context.get('trend', 'unknown')
-        market_alignment = (
-            (sentiment_score > 0 and market_trend in ['bullish', 'strongly bullish']) or
-            (sentiment_score < 0 and market_trend in ['bearish', 'strongly bearish'])
-        )
+        nearest_support = min(supports, key=lambda x: abs(x - current_price)) if supports else current_price * 0.9
+        nearest_resistance = min(resistances, key=lambda x: abs(x - current_price)) if resistances else current_price * 1.1
+
+        # Summarize technical analysis concisely
+        tech_summary = f"Rating: {tech_analysis.get('technical_rating', 'Unknown')}, Score: {tech_analysis.get('technical_score', 0)}/{tech_analysis.get('max_score', 14)}"
         daily_signals = tech_analysis.get('signals', {}).get('daily', {})
-        default_stop_pct = -7.5 if sentiment_score > 0 else 7.5
-        default_stop_price = round(current_price * (1 + default_stop_pct / 100), 2)
-        stock = yf.Ticker(ticker)
-        stock_options = stock.options
-        best_expiry = None
-        call_strikes = []
-        put_strikes = []
-        if stock_options:
-            for exp in stock_options:
-                exp_date = datetime.datetime.strptime(exp, '%Y-%m-%d')
-                days_to_exp = (exp_date - datetime.datetime.now()).days
-                if impact_timing == "immediate" and days_to_exp >= 7:
-                    best_expiry = exp
-                    break
-                elif impact_timing in ["1-3 days", "1-2 weeks"] and 14 <= days_to_exp <= 35:
-                    best_expiry = exp
-                    break
-                elif 30 <= days_to_exp <= 60:
-                    best_expiry = exp
-                    break
-            if not best_expiry:
-                best_expiry = stock_options[0]
-            chain = stock.option_chain(best_expiry)
-            calls_df = chain.calls
-            puts_df = chain.puts
-            calls_itm = calls_df[calls_df['strike'] < current_price].sort_values('strike', ascending=False)
-            calls_otm = calls_df[calls_df['strike'] >= current_price].sort_values('strike')
-            if not calls_itm.empty:
-                call_strikes.append(calls_itm.iloc[0]['strike'])
-            if len(calls_otm) >= 2:
-                call_strikes.extend([calls_otm.iloc[0]['strike'], calls_otm.iloc[1]['strike']])
-            elif not calls_otm.empty:
-                call_strikes.append(calls_otm.iloc[0]['strike'])
-            puts_itm = puts_df[puts_df['strike'] > current_price].sort_values('strike')
-            puts_otm = puts_df[puts_df['strike'] <= current_price].sort_values('strike', ascending=False)
-            if not puts_itm.empty:
-                put_strikes.append(puts_itm.iloc[0]['strike'])
-            if len(puts_otm) >= 2:
-                put_strikes.extend([puts_otm.iloc[0]['strike'], puts_otm.iloc[1]['strike']])
-            elif not puts_otm.empty:
-                put_strikes.append(puts_otm.iloc[0]['strike'])
-        if use_options:
-            bull_options = [opt for opt in options_activity.get('unusual_activity', []) if opt.get('type') == 'call' and sentiment_score >= 0]
-            bear_options = [opt for opt in options_activity.get('unusual_activity', []) if opt.get('type') == 'put' and sentiment_score <= 0]
-            if sentiment_score > 0.3 and bull_options and daily_signals.get('obv_increasing', False):
-                strategy_type = "bullish_options"
-                best_options = sorted(bull_options, key=lambda x: x.get('vol_oi_ratio', 0), reverse=True)[:3]
-                expiry_days = [(datetime.datetime.strptime(opt['expiration'], '%Y-%m-%d') - datetime.datetime.now()).days for opt in best_options]
-                recommend_call = (
-                    f"{best_options[0]['strike']} strike, expiring {best_options[0]['expiration']}" if best_options else
-                    f"{call_strikes[0] if call_strikes else round(current_price * 1.05, 2)} strike, expiring {best_expiry}"
-                )
-                if impact_timing == 'immediate' and any(days < 14 for days in expiry_days):
-                    strategy = f"Short-term call options - {recommend_call}"
-                    stop = f"Stop loss: Close position if underlying drops below ${nearest_support:.2f} or if option loses 40% of premium"
-                elif impact_timing in ['1-3 days', '1-2 weeks'] and any(14 <= days <= 45 for days in expiry_days):
-                    strategy = f"Medium-term call options - {recommend_call}"
-                    stop = f"Stop loss: Close position if underlying drops below ${nearest_support:.2f} or if option loses 40% of premium"
-                else:
-                    strategy = f"Long call + stock position - {recommend_call}"
-                    stop = f"Stop loss: Close position if underlying drops below ${nearest_support:.2f} or if option loses 40% of premium"
-            elif sentiment_score < -0.3 and bear_options:
-                strategy_type = "bearish_options"
-                best_options = sorted(bear_options, key=lambda x: x.get('vol_oi_ratio', 0), reverse=True)[:3]
-                recommend_put = (
-                    f"{best_options[0]['strike']} strike, expiring {best_options[0]['expiration']}" if best_options else
-                    f"{put_strikes[0] if put_strikes else round(current_price * 0.95, 2)} strike, expiring {best_expiry}"
-                )
-                if impact_timing in ['immediate', '1-3 days']:
-                    strategy = f"Put options - {recommend_put}"
-                    stop = f"Stop loss: Close position if underlying rises above ${nearest_resistance:.2f} or if option loses 40% of premium"
-                else:
-                    strategy = f"Bear put spread - Buy {put_strikes[0]} puts and sell {put_strikes[1]} puts, expiring {best_expiry}"
-                    stop = f"Stop loss: Close position if underlying rises above ${nearest_resistance:.2f} or if spread loses 40% of premium"
-            elif abs(sentiment_score) > 0.5:
-                strategy_type = "directional_options"
-                if sentiment_score > 0:
-                    strategy = f"Long call options - {call_strikes[0] if call_strikes else round(current_price * 1.03, 2)} strike, expiring {best_expiry}"
-                    stop = f"Stop loss: Close position if underlying drops below ${nearest_support:.2f} or if option loses 45% of premium"
-                else:
-                    strategy = f"Long put options - {put_strikes[0] if put_strikes else round(current_price * 0.97, 2)} strike, expiring {best_expiry}"
-                    stop = f"Stop loss: Close position if underlying rises above ${nearest_resistance:.2f} or if option loses 45% of premium"
+        if daily_signals:
+            if daily_signals.get('price_above_sma50'): tech_summary += ", Price > 50-day MA"
+            if daily_signals.get('macd_bullish'): tech_summary += ", MACD Bullish"
+            rsi = daily_signals.get('rsi_value', 0)
+            if rsi > 70: tech_summary += ", RSI Overbought"
+            elif rsi < 30: tech_summary += ", RSI Oversold"
+
+        # Summarize options activity
+        options_summary = options_activity.get('assessment', 'No options data available')
+        if options_activity.get('unusual_activity'):
+            call_count = sum(1 for act in options_activity['unusual_activity'] if act['type'] == 'call')
+            put_count = sum(1 for act in options_activity['unusual_activity'] if act['type'] == 'put')
+            options_summary += f", {call_count} calls, {put_count} puts"
+
+        # Summarize news analysis
+        news_summary = "No news data" if not news_analysis else (
+            f"Sentiment: {news_analysis.get('sentiment', 'Unknown')} (Score: {news_analysis.get('sentiment_score', 'N/A')}), "
+            f"Impact: {news_analysis.get('price_impact_range', 'Unknown')}, "
+            f"Timing: {news_analysis.get('impact_timing', 'Unknown')}"
+        )
+
+        # Summarize market context
+        market_summary = (
+            f"Trend: {market_context.get('trend', 'Unknown')}, "
+            f"SPY: {market_context.get('spy_price', 'N/A')} ({market_context.get('spy_change_1d', 0):.1f}%), "
+            f"VIX: {market_context.get('vix', 0):.1f}"
+        )
+
+        # Construct the prompt for the AI model
+        prompt = f"""
+Act as an expert trading strategist. Use the following information to recommend the best trading strategy for {ticker}:
+
+Trader Preferences (consider these as guidance, not strict rules):
+- Prefers options for asymmetric risk-reward and shorter time frames.
+- Prefers lower cost of capital.
+- Uses puts instead of shorting stock.
+
+Current Price: ${current_price:.2f}
+
+Technical Analysis:
+- Support: ${nearest_support:.2f}
+- Resistance: ${nearest_resistance:.2f}
+- {tech_summary}
+
+Options Activity: {options_summary}
+
+News Analysis: {news_summary}
+
+Market Context: {market_summary}
+
+Analyze all this data and decide on the best trading strategy—or recommend no trade if conditions aren’t favorable. You may deviate from the trader’s preferences if justified (e.g., higher cost of capital for a compelling opportunity). 
+
+If recommending a trade, return a JSON object with:
+- 'strategy_type': e.g., 'bullish_options', 'bearish_stock'
+- 'entry': entry point or range (e.g., '$50-$51')
+- 'target': profit target (e.g., '$55')
+- 'stop_loss': stop loss level (e.g., '$48')
+- 'position_size': suggested size (e.g., '2% of portfolio')
+- 'options_details': specific options if applicable (e.g., 'Buy 1 $50 call expiring Dec 20')
+- 'risk_reward': estimated risk-reward ratio (e.g., 3.5)
+- 'market_aligned': true/false (aligns with market trend?)
+- 'explanation': why this strategy makes sense
+
+If no trade is recommended, return a JSON object with:
+- 'recommendation': 'No Trade'
+- 'explanation': why no trade is advised
+
+Return your response as a valid JSON object.
+"""
+
+        # Define models in the desired fallback order
+        models = [
+            "claude-3-7-sonnet-20250219",
+            "deepseek-reasoner",
+            "gemini-2.0-flash-thinking-exp-01-21",
+            "gemini-2.0-flash"
+        ]
+
+        # Make the API call
+        success, response = robust_api_call(models, prompt, config={'response_mime_type': 'application/json'}, max_tokens=4000)
+
+        if not success:
+            logger.error(f"API call failed for {ticker}: {response}")
+            return {"type": "error", "strategy": "Failed to generate strategy"}
+
+        # Parse the model’s JSON response
+        try:
+            strategy_data = json.loads(response)
+
+            if strategy_data.get('recommendation') == 'No Trade':
+                return {
+                    "type": "no_trade",
+                    "strategy": "No trade recommended",
+                    "position_size": "N/A",
+                    "entry": "N/A",
+                    "target": "N/A",
+                    "stop_loss": "N/A",
+                    "risk_reward": 0,
+                    "market_aligned": False,
+                    "explanation": strategy_data.get('explanation', 'No explanation provided')
+                }
             else:
-                strategy_type = "neutral_options"
-                if sentiment_score > 0:
-                    strategy = f"Bull call spread - Buy {call_strikes[0]} calls and sell {call_strikes[1]} calls, expiring {best_expiry}"
-                    stop = f"Stop loss: Close position if underlying drops below ${(current_price * 0.95):.2f} or if spread loses 45% of premium"
-                else:
-                    strategy = f"Bear put spread - Buy {put_strikes[0]} puts and sell {put_strikes[1]} puts, expiring {best_expiry}"
-                    stop = f"Stop loss: Close position if underlying rises above ${(current_price * 1.05):.2f} or if spread loses 45% of premium"
-        else:
-            if sentiment_score > 0.3 and daily_signals.get('obv_increasing', False):
-                strategy_type = "bullish_stock"
-                strategy = "Long stock position with stop at nearest support"
-                stop = f"Stop loss: ${nearest_support:.2f} (-{potential_downside:.1f}%)"
-            elif sentiment_score < -0.3:
-                strategy_type = "bearish_stock"
-                strategy = "Short stock position with stop at nearest resistance"
-                stop = f"Stop loss: ${nearest_resistance:.2f} (+{potential_upside:.1f}%)"
-            else:
-                strategy_type = "neutral_stock"
-                strategy = "Wait for confirmation before entry"
-                stop = f"Stop loss: ${default_stop_price:.2f} ({default_stop_pct:.1f}%)"
-        position_size = "1-2% of portfolio" if risk_reward <= 2 else "2-3% of portfolio" if risk_reward <= 3 else "3-5% of portfolio"
-        if strategy_type.startswith('bullish'):
-            entry = f"Enter at current price (${current_price:.2f}) or on pullback to ${(current_price * 0.98):.2f}"
-            target = f"Target: ${nearest_resistance:.2f} (+{potential_upside:.1f}%)"
-        elif strategy_type.startswith('bearish'):
-            entry = f"Enter at current price (${current_price:.2f}) or on bounce to ${(current_price * 1.02):.2f}"
-            target = f"Target: ${nearest_support:.2f} (-{potential_downside:.1f}%)"
-        else:
-            entry = f"Enter on confirmation at ${current_price:.2f} with 25% position, add on momentum"
-            target = f"Target: Initial target ${(current_price * (1 + (sentiment_score * 10))):.2f} (~{abs(sentiment_score * 10):.1f}% move)"
-        return {
-            "type": strategy_type,
-            "strategy": strategy,
-            "position_size": position_size,
-            "entry": entry,
-            "target": target,
-            "stop_loss": stop,
-            "risk_reward": risk_reward,
-            "market_aligned": market_alignment
-        }
+                return {
+                    "type": strategy_data.get('strategy_type', 'unknown'),
+                    "strategy": f"{strategy_data.get('strategy_type', 'unknown').replace('_', ' ').title()}: {strategy_data.get('options_details', '')}",
+                    "position_size": strategy_data.get('position_size', 'N/A'),
+                    "entry": strategy_data.get('entry', 'N/A'),
+                    "target": strategy_data.get('target', 'N/A'),
+                    "stop_loss": strategy_data.get('stop_loss', 'N/A'),
+                    "risk_reward": float(strategy_data.get('risk_reward', 0)),
+                    "market_aligned": bool(strategy_data.get('market_aligned', False)),
+                    "explanation": strategy_data.get('explanation', 'No explanation provided')
+                }
+        except json.JSONDecodeError:
+            logger.error(f"Invalid JSON response for {ticker}: {response}")
+            return {"type": "error", "strategy": "Failed to parse strategy"}
+
     except Exception as e:
-        logger.error(f"Error generating trade strategy for {ticker}: {e}")
+        logger.error(f"Error generating strategy for {ticker}: {e}")
         return {"type": "error", "strategy": "Unable to generate strategy"}
 
 def generate_risk_reward_chart(ticker, strategy, run_timestamp):
+    """
+    Generates a risk/reward chart in JSON format based on the trade strategy.
+    
+    Args:
+        ticker (str): Stock ticker symbol.
+        strategy (dict): Trading strategy details.
+        run_timestamp (str): Timestamp of the run for file storage.
+    """
     try:
         entry = strategy.get('entry', '')
-        
-        # Improved price extraction with regex
         current_price_match = re.search(r'\$(\d+\.\d+)', entry)
         if not current_price_match:
             logger.warning(f"No valid entry price found for {ticker}")
             return
-            
         current_price = float(current_price_match.group(1))
         
         target_match = re.search(r'\$(\d+\.\d+)', strategy.get('target', ''))
         stop_match = re.search(r'\$(\d+\.\d+)', strategy.get('stop_loss', ''))
-        
         if not target_match or not stop_match:
             logger.warning(f"Missing target or stop price for {ticker}")
             return
-            
+        
         target_price = float(target_match.group(1))
         stop_price = float(stop_match.group(1))
         
@@ -238,9 +276,7 @@ def generate_risk_reward_chart(ticker, strategy, run_timestamp):
             'strategy_type': strategy.get('type', 'unknown')
         }
         
-        # Ensure directory exists
         os.makedirs(os.path.join(RECOMMENDATIONS_DIR, run_timestamp), exist_ok=True)
-        
         chart_file = os.path.join(RECOMMENDATIONS_DIR, run_timestamp, f"{ticker}_risk_reward.json")
         with open(chart_file, "w") as f:
             json.dump(chart_data, f, indent=4)
@@ -249,6 +285,18 @@ def generate_risk_reward_chart(ticker, strategy, run_timestamp):
         logger.error(f"Error generating risk/reward chart for {ticker}: {e}")
 
 def generate_trade_confidence(ticker, headline, analysis, tech_analysis):
+    """
+    Generates a confidence score for the trade using an API call to a thinking model.
+    
+    Args:
+        ticker (str): Stock ticker symbol.
+        headline (str): News headline.
+        analysis (dict): News analysis data.
+        tech_analysis (dict): Technical analysis data.
+    
+    Returns:
+        dict: Confidence score and reasoning.
+    """
     try:
         prompt = (
             f"Act as a professional hedge fund manager evaluating this trade idea. "
@@ -261,22 +309,28 @@ def generate_trade_confidence(ticker, headline, analysis, tech_analysis):
             f"Key Signals: {tech_analysis.get('technical_score', 0)} out of {tech_analysis.get('max_score', 14)} points\n\n"
             f"Return a JSON object with 'confidence_score' (number from 0 to 10) and 'reasoning' (string)."
         )
-        THINKING_MODELS = [
-            "deepseek-reasoner",
-            "gemini-2.0-flash-thinking-exp-01-21",
-            "claude-3-7-sonnet-20250219"
-        ]
-        config = {'response_mime_type': 'application/json'} if "gemini" in THINKING_MODELS[0] else None
-        success, response = robust_api_call(THINKING_MODELS, prompt, config, max_tokens=4000, retries=2)
+        models = ["gemini-2.0-flash"]
+        config = {'response_mime_type': 'application/json'}
+        success, response = robust_api_call(models, prompt, config, max_tokens=4000, retries=2)
         if success and 'confidence_score' in response and 'reasoning' in response:
             return response
-        logger.error("All thinking models failed for generate_trade_confidence")
+        logger.error("Failed to generate trade confidence")
         return {'confidence_score': 5, 'reasoning': "Unable to generate confidence assessment"}
     except Exception as e:
         logger.error(f"Error in trade confidence generation: {e}")
         return {'confidence_score': 5, 'reasoning': "Error in analysis"}
 
 def save_enhanced_recommendation(run_timestamp, headline, analysis, summary, trade_evaluation):
+    """
+    Saves an enhanced trade recommendation to files.
+    
+    Args:
+        run_timestamp (str): Timestamp of the run.
+        headline (str): News headline.
+        analysis (dict): News analysis data.
+        summary (str): Summary of the trade (unused here but kept for compatibility).
+        trade_evaluation (dict): Trade evaluation data.
+    """
     try:
         ticker = trade_evaluation.get('ticker', 'unknown')
         score = trade_evaluation.get('overall_score', 0)
@@ -284,13 +338,16 @@ def save_enhanced_recommendation(run_timestamp, headline, analysis, summary, tra
         if score < MIN_OVERALL_SCORE:
             logger.info(f"Skipping low-score ({score:.1f}) recommendation for {ticker}: {headline}")
             return
+        
         run_dir = os.path.join(RECOMMENDATIONS_DIR, run_timestamp)
         ticker_dir = os.path.join(RECOMMENDATIONS_DIR, "by_ticker")
         os.makedirs(run_dir, exist_ok=True)
         os.makedirs(ticker_dir, exist_ok=True)
+        
         filename = os.path.join(run_dir, f"{ticker}_{recommendation.lower().replace(' ', '_')}.txt")
         ticker_file = os.path.join(ticker_dir, f"{ticker}.txt")
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
         trade_confidence = trade_evaluation.get('trade_confidence', {})
         confidence_text = f"""
 TRADE CONFIDENCE:
@@ -345,6 +402,7 @@ MARKET CONTEXT:
             f.write(recommendation_text)
         with open(ticker_file, "a") as f:
             f.write(recommendation_text)
+        
         add_to_watchlist(
             ticker,
             headline,
@@ -359,6 +417,15 @@ MARKET CONTEXT:
         logger.error(f"Error saving enhanced recommendation: {e}")
 
 def summarize_technical_signals(trade_evaluation):
+    """
+    Summarizes key technical signals from the trade evaluation.
+    
+    Args:
+        trade_evaluation (dict): Trade evaluation data.
+    
+    Returns:
+        str: Summary of technical signals.
+    """
     try:
         daily_signals = trade_evaluation.get('factors', {}).get('technical', {}).get('details', {}).get('signals', {}).get('daily', {})
         if not daily_signals:
@@ -380,6 +447,15 @@ def summarize_technical_signals(trade_evaluation):
         return "Error processing technical signals"
 
 def summarize_options_activity(trade_evaluation):
+    """
+    Summarizes options activity from the trade evaluation.
+    
+    Args:
+        trade_evaluation (dict): Trade evaluation data.
+    
+    Returns:
+        str: Summary of options activity.
+    """
     try:
         options_details = trade_evaluation.get('factors', {}).get('options_activity', {}).get('details', {})
         unusual_activity = options_details.get('unusual_activity', [])
@@ -393,3 +469,12 @@ def summarize_options_activity(trade_evaluation):
     except Exception as e:
         logger.error(f"Error summarizing options activity: {e}")
         return "Error processing options activity"
+
+def get_cache_timestamp():
+    """
+    Returns a timestamp for caching purposes (hourly granularity).
+    
+    Returns:
+        int: Unix timestamp divided by 3600 (hours).
+    """
+    return int(datetime.datetime.now().timestamp() // 3600)

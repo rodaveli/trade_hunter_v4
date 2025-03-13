@@ -1,47 +1,39 @@
-#!/usr/bin/env python3
-import time
-import sys
 import os
+import sys
+import time
+import json
 import datetime
-import feedparser
-from config import FEED_URLS, SINGLE_RUN_MODE, RECOMMENDATIONS_DIR, BACKTEST_DIR, PARALLELISM, MIN_OVERALL_SCORE, MODEL_THINKING, logger, BATCH_SIZE, ENABLE_BACKTESTING
-from utils import load_processed_articles, save_processed_articles, load_daily_stats, save_daily_stats, update_watchlist_performance, is_recent
-from data import fetch_full_text
-from analysis import batch_generic_check, batch_analyze_headlines, get_ticker_symbol, analyze_company_context, is_valid_ticker
-from trade import evaluate_trade_opportunity, save_enhanced_recommendation, generate_trade_confidence
-from backtest import update_backtests, simulate_trade_performance
-from api import check_market_events
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
+from config import FEED_URLS, BATCH_SIZE, PARALLELISM, MIN_OVERALL_SCORE, SINGLE_RUN_MODE, ENABLE_BACKTESTING, RECOMMENDATIONS_DIR, BACKTEST_DIR, logger
+from utils import load_processed_articles, save_processed_articles, load_daily_stats, save_daily_stats, is_recent, update_watchlist_performance, add_to_watchlist
+from data import fetch_full_text, get_company_fundamentals, get_current_price, is_valid_ticker
+from analysis import batch_generic_check, batch_analyze_headlines, get_ticker_symbol, analyze_company_context
+from trade import evaluate_trade_opportunity, generate_trade_confidence, save_enhanced_recommendation, simulate_trade_performance
+from backtest import update_backtests
+from api import check_market_events
+import feedparser
 
 def debug_feeds():
-    """Test parsing each feed to identify issues"""
-    logger.info("Debug mode: Testing feed parsing...")
+    """Test each feed URL to ensure it's accessible and contains entries"""
+    logger.info("Starting feed debugging...")
     
     for feed_url in FEED_URLS:
+        logger.info(f"Testing feed: {feed_url}")
         try:
-            logger.info(f"Testing feed: {feed_url}")
-            feed = feedparser.parse(feed_url, timeout=15)
+            # Parse with timeout
+            feed = feedparser.parse(feed_url, request_timeout=10)
             
-            # Log feed status
-            if hasattr(feed, 'status'):
-                logger.info(f"  Status: {feed.status}")
-            
-            # Log feed bozo (error flag)
+            # Check for parsing errors
             if hasattr(feed, 'bozo') and feed.bozo:
-                logger.error(f"  Feed parse error: {feed.get('bozo_exception', 'Unknown error')}")
+                logger.error(f"Feed parsing error: {feed.get('bozo_exception', 'Unknown error')}")
+                continue
             
-            # Log entry count
-            logger.info(f"  Entries: {len(feed.entries)}")
-            
-            # Test first entry if available
+            # Check if entries exist
             if feed.entries:
+                logger.info(f"  Found {len(feed.entries)} entries")
+                # Test first entry for date parsing
                 entry = feed.entries[0]
-                logger.info(f"  First entry title: {entry.get('title', 'No title')}")
-                logger.info(f"  First entry date fields: {[k for k in entry.keys() if 'date' in k.lower() or 'time' in k.lower() or 'pub' in k.lower()]}")
-                
-                if 'pubDate' in entry:
-                    logger.info(f"  pubDate: {entry.pubDate}")
+                logger.info(f"  Sample title: {entry.get('title', 'No title')[:50]}...")
                 
                 # Test is_recent function
                 is_rec = is_recent(entry)
@@ -54,7 +46,6 @@ def debug_feeds():
     
     logger.info("Feed testing complete")
 
-# Removed local ENABLE_BACKTESTING definition - use the one from config.py instead
 def check_feeds_availability():
     """Check if the RSS feeds are available and contain entries"""
     import requests
@@ -305,7 +296,7 @@ def run_maintenance_tasks():
         # Check for significant market events
         logger.info("Starting market events check")
         try:
-            events_info = check_market_events(MODEL_THINKING)
+            events_info = check_market_events("gemini-2.0-flash")
             
             # Validate the response
             if not isinstance(events_info, dict):

@@ -1,0 +1,2456 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+================================================================
+File Summary
+================================================================
+
+Purpose:
+--------
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+
+File Format:
+------------
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Multiple file entries, each consisting of:
+  a. A separator line (================)
+  b. The file path (File: path/to/file)
+  c. Another separator line
+  d. The full contents of the file
+  e. A blank line
+
+Usage Guidelines:
+-----------------
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+
+Notes:
+------
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+
+Additional Info:
+----------------
+
+================================================================
+Directory Structure
+================================================================
+analysis.py
+api.py
+backtest.py
+config.py
+daily_stats.json
+data.py
+feed_debug.txt
+main.py
+processed_articles.json
+REAMDE.md
+trade.py
+utils.py
+
+================================================================
+Files
+================================================================
+
+================
+File: analysis.py
+================
+import talib
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from api import robust_api_call
+from config import MODEL_JSON, MODEL_TICKER, logger
+from data import is_valid_ticker
+
+def batch_generic_check(headlines, model=MODEL_JSON):
+    prompt = (
+        "Classify each headline as 'generic' or 'not generic'. "
+        "Generic headlines are routine or minor updates such as regular earnings reports, scheduled executive changes, or small product launches. "
+        "Not generic headlines involve significant, potentially market-moving events like mergers, acquisitions, unexpected earnings surprises, major product breakthroughs, or high-impact regulatory changes. "
+        "IMPORTANT: If there's any doubt, classify as 'not generic' to avoid missing potentially valuable trading opportunities. Be conservative - only classify as 'not generic' if the headline strongly indicates a significant market-moving event."
+        "Return JSON: [{'headline': <string>, 'answer': <string>}].\n\n"
+        "Examples:\n"
+        "- 'Company X Reports Q2 Earnings In Line With Expectations' -> generic\n"
+        "- 'Company X Earnings Beat Expectations by 5%' -> not generic\n"
+        "- 'Company Y Announces Merger with Z' -> not generic\n"
+        "- 'Company A Appoints New CFO As Planned' -> generic\n"
+        "- 'Company A Unexpectedly Replaces CFO After Accounting Issues' -> not generic\n"
+        "- 'Company B Beats Earnings Estimates by 10%' -> not generic\n"
+        "- 'Company C Launches New Smartphone Model' -> generic\n"
+        "- 'Company C's New Smartphone Features Breakthrough Battery Technology' -> not generic\n"
+        "- 'Company D Receives FDA Approval for Revolutionary Drug' -> not generic\n\n"
+        "Headlines:\n"
+        + "\n".join(f"{i}. {h}" for i, h in enumerate(headlines, 1))
+    )
+    config = {'response_mime_type': 'application/json'}
+    success, response = robust_api_call([model], prompt, config, max_tokens=2000)
+    if success and isinstance(response, list):
+        return {item["headline"]: (item["answer"].lower() == "generic") for item in response if 'headline' in item and 'answer' in item}
+    logger.error("Failed to classify headlines")
+    return {}
+
+def batch_analyze_headlines(items, model=MODEL_JSON):
+    prompt = (
+        "Analyze each item using the headline and full text. Check if it's about a public company and a market catalyst. "
+        "If it's about a public company, include the stock ticker symbol. "
+        "Also determine sentiment (positive, negative, neutral) with a score (-1 to 1). "
+        "Evaluate the potential timing of impact (immediate, 1-3 days, 1-2 weeks, 1+ month). "
+        "Estimate approximate price impact percentage range. "
+        "Detect if this is likely a 'sell the_news' event where positive headlines might cause selling. "
+        "Assign confidence as 'very-high', 'high', 'medium', or 'low' based on the following criteria: "
+        "'very-high' for clear, significant market-moving events (e.g., major mergers, acquisitions, unexpected earnings surprises); "
+        "'high' for likely impactful events; 'medium' for possibly relevant events; 'low' for generic or unrelated news. "
+        "Return JSON: [{'headline': <string>, 'is_public_company': <bool>, 'ticker': <string or null>, 'market_catalyst': <string>, "
+        "'confidence': <'very-high'|'high'|'medium'|'low'>, 'sentiment': <string>, 'sentiment_score': <float>, "
+        "'impact_timing': <string>, 'price_impact_range': <string>, 'sell_the_news': <bool>, 'analysis': <string>}].\n\n"
+        "If it's a public company, include the stock ticker symbol in the 'ticker' field. If no ticker can be determined, set 'ticker' to null.\n\nItems:\n"
+        + "\n".join(f"{i}. Headline: {item['headline']}\n   Full Text: {item['full_text'][:2000]}..." for i, item in enumerate(items, 1))
+    )
+    config = {'response_mime_type': 'application/json'}
+    success, response = robust_api_call([model], prompt, config, max_tokens=2000)
+    if success and isinstance(response, list):
+        required_keys = ['headline', 'is_public_company', 'ticker', 'market_catalyst', 'confidence', 'sentiment', 'sentiment_score', 'impact_timing', 'price_impact_range', 'sell_the_news', 'analysis']
+        return {item["headline"]: item for item in response if isinstance(item, dict) and all(k in item for k in required_keys)}
+    logger.error("Failed to analyze headlines")
+    return {}
+
+def get_ticker_symbol(headline: str, analysis_text: str, model=MODEL_TICKER) -> str:
+    """
+    Extract the stock ticker symbol from a headline and analysis using Google Gemini with grounding.
+    
+    Args:
+        headline: The news headline
+        analysis_text: Additional analysis text that might contain company information
+        model: The model to use for extraction (default is MODEL_TICKER from config)
+        
+    Returns:
+        A valid ticker symbol or None if no valid ticker is found
+    """
+    try:
+        # First attempt with Google Search grounding
+        prompt = (
+            f"TASK: Extract the stock ticker symbol from the following headline and analysis.\n\n"
+            f"HEADLINE: {headline}\n\n"
+            f"ANALYSIS: {analysis_text}\n\n"
+            f"INSTRUCTIONS:\n"
+            f"1. Identify the public company or companies mentioned in the headline or analysis.\n"
+            f"2. If a ticker symbol is explicitly mentioned, use that.\n"
+            f"3. If no ticker is mentioned but a company name is present, infer the most likely ticker symbol.\n"
+            f"4. If multiple companies are mentioned, choose the main subject of the headline.\n"
+            f"5. If no ticker can be confidently determined, return {{'ticker': null}}\n"
+            f"6. Only include standard US stock tickers (NYSE, NASDAQ, etc.)\n"
+            f"7. If the ticker is uncertain, use Google Search to verify it.\n\n"
+            f"RESPONSE FORMAT: {{'ticker': 'SYMBOL'}} or {{'ticker': null}} if no ticker found"
+        )
+        
+        # Configure Google Search as a tool as shown in the documentation
+        google_search_config = {
+            'response_mime_type': 'application/json',
+            'tools': [{'google_search': {}}]
+        }
+        
+        # Try with search grounding first
+        success, response = robust_api_call([model], prompt, google_search_config)
+        
+        if success and isinstance(response, dict) and 'ticker' in response:
+            ticker = response['ticker']
+            if is_valid_ticker(ticker):
+                logger.info(f"Found and verified ticker (with grounding): {ticker}")
+                return ticker
+        
+        # Fall back to standard prompt if grounding doesn't work
+        config = {'response_mime_type': 'application/json'}
+        success, response = robust_api_call([model], prompt, config)
+        
+        if success and isinstance(response, dict) and 'ticker' in response:
+            ticker = response['ticker']
+            if is_valid_ticker(ticker):
+                logger.info(f"Found and verified ticker: {ticker}")
+                return ticker
+            
+        logger.info(f"No valid ticker found for headline: '{headline}'")
+        return None
+    except Exception as e:
+        logger.error(f"Error extracting ticker symbol: {e}")
+        return None
+
+# This function is no longer needed since we're using is_valid_ticker
+# def ticker_is_valid(ticker):
+#     """Helper function to validate a ticker symbol"""
+#     if ticker is None:
+#         return False
+#         
+#     ticker = str(ticker).strip().upper()
+#     
+#     # Quick validation checks
+#     if not ticker or len(ticker) > 5 or not ticker.isalnum():
+#         return False
+#     
+#     # Validate ticker using yfinance
+#     return is_valid_ticker(ticker)
+
+def analyze_company_context(ticker, headline, analysis_text, fundamentals):
+    try:
+        if not fundamentals:
+            return {
+                "relevant": False,
+                "impact_assessment": "No fundamental data available to assess impact",
+                "financial_strength": "Unknown",
+                "risk_adjustment": 0
+            }
+        metrics_text = "\n".join([f"{k}: {v}" for k, v in fundamentals.items() if v is not None])
+        prompt = (
+            f"As a financial analyst, evaluate how the following news relates to {ticker}'s fundamentals.\n\n"
+            f"News Headline: {headline}\n\n"
+            f"News Analysis: {analysis_text}\n\n"
+            f"Company Financials:\n{metrics_text}\n\n"
+            f"Analyze:\n"
+            f"1. Is this news materially significant given the company's size and business? (Yes/No)\n"
+            f"2. Briefly analyze how this news relates to the company's financials (2-3 sentences)\n"
+            f"3. Assess company's financial position as 'strong', 'moderate', or 'weak'\n"
+            f"4. Suggest a position size adjustment factor from -2 to +2 (-2 = much smaller position due to weak fundamentals, 0 = no adjustment, +2 = increase position size due to strong fundamentals)\n\n"
+            f"Provide a JSON response with keys: 'relevant', 'impact_assessment', 'financial_strength', 'risk_adjustment'."
+        )
+        THINKING_MODELS = [
+            "deepseek-reasoner",
+            "gemini-2.0-flash-thinking-exp-01-21",
+            "claude-3-7-sonnet-20250219"
+        ]
+        config = {'response_mime_type': 'application/json'} if "gemini" in THINKING_MODELS[0] else None
+        success, response = robust_api_call(THINKING_MODELS, prompt, config, max_tokens=4000, retries=2)
+        if success:
+            return response
+        logger.error("All thinking models failed for analyze_company_context")
+        return {
+            "relevant": False,
+            "impact_assessment": "Failed to get valid response",
+            "financial_strength": "Unknown",
+            "risk_adjustment": 0
+        }
+    except Exception as e:
+        logger.error(f"Error in company context analysis: {e}")
+        return {
+            "relevant": False,
+            "impact_assessment": "Error in analysis",
+            "financial_strength": "Unknown",
+            "risk_adjustment": 0
+        }
+
+def perform_technical_analysis(ticker):
+    try:
+        stock = yf.Ticker(ticker)
+        timeframes = {
+            'intraday': {'period': "5d", 'interval': "15m"},
+            'daily': {'period': "120d", 'interval': "1d"},
+            'weekly': {'period': "1y", 'interval': "1wk"}
+        }
+        data = {}
+        for tf_name, tf_params in timeframes.items():
+            df = stock.history(**tf_params)
+            if not df.empty and len(df) > 30:
+                data[tf_name] = df
+        if not data:
+            logger.error(f"No data available for technical analysis of {ticker}")
+            return {
+                'ticker': ticker,
+                'technical_score': 0,
+                'max_score': 14,
+                'technical_rating': "No Data",
+                'signals': {},
+                'support_resistance': {}
+            }
+        signals = {}
+        tech_score = 0
+        max_score = 14
+        for timeframe, df in data.items():
+            close = df['Close']
+            high = df['High']
+            low = df['Low']
+            volume = df['Volume']
+            signals[timeframe] = {}
+            sma20 = talib.SMA(close, timeperiod=20)
+            sma50 = talib.SMA(close, timeperiod=50)
+            sma200 = talib.SMA(close, timeperiod=200) if len(close) >= 200 else pd.Series([np.nan] * len(close))
+            price_above_sma20 = close.iloc[-1] > sma20.iloc[-1]
+            price_above_sma50 = close.iloc[-1] > sma50.iloc[-1]
+            price_above_sma200 = False if np.isnan(sma200.iloc[-1]) else close.iloc[-1] > sma200.iloc[-1]
+            ma_alignment_bullish = sma20.iloc[-1] > sma50.iloc[-1]
+            ma_alignment_strongly_bullish = ma_alignment_bullish and (not np.isnan(sma200.iloc[-1]) and sma50.iloc[-1] > sma200.iloc[-1])
+            signals[timeframe].update({
+                'price_above_sma20': price_above_sma20,
+                'price_above_sma50': price_above_sma50,
+                'price_above_sma200': price_above_sma200,
+                'ma_alignment_bullish': ma_alignment_bullish,
+                'ma_alignment_strongly_bullish': ma_alignment_strongly_bullish
+            })
+            if timeframe in ['daily', 'weekly']:
+                if price_above_sma20: tech_score += 0.5
+                if price_above_sma50: tech_score += 0.5
+                if price_above_sma200 and timeframe == 'daily': tech_score += 1
+                if ma_alignment_strongly_bullish: tech_score += 1
+            if timeframe == 'daily':
+                sma50_above_sma200 = False if np.isnan(sma200.iloc[-1]) else sma50.iloc[-1] > sma200.iloc[-1]
+                signals[timeframe]['sma50_above_sma200'] = sma50_above_sma200
+                if sma50_above_sma200:
+                    tech_score += 1
+                roc = talib.ROC(close, timeperiod=12)
+                roc_value = roc.iloc[-1] if not np.isnan(roc.iloc[-1]) else 0
+                roc_positive = roc_value > 0
+                signals[timeframe]['roc'] = roc_value
+                signals[timeframe]['roc_positive'] = roc_positive
+                if roc_positive:
+                    tech_score += 0.5
+            macd, macd_signal, macd_hist = talib.MACD(close)
+            macd_bullish = macd_hist.iloc[-1] > 0
+            macd_bullish_crossover = macd_hist.iloc[-1] > 0 and macd_hist.iloc[-2] <= 0
+            signals[timeframe].update({
+                'macd_bullish': macd_bullish,
+                'macd_bullish_crossover': macd_bullish_crossover
+            })
+            if timeframe == 'daily' and macd_bullish: tech_score += 1
+            if timeframe in ['daily', 'weekly'] and macd_bullish_crossover: tech_score += 1
+            rsi = talib.RSI(close, timeperiod=14)
+            rsi_value = rsi.iloc[-1]
+            rsi_bullish = 40 <= rsi_value <= 70
+            rsi_overbought = rsi_value > 70
+            rsi_oversold = rsi_value < 30
+            signals[timeframe].update({
+                'rsi_value': rsi_value,
+                'rsi_bullish': rsi_bullish,
+                'rsi_overbought': rsi_overbought,
+                'rsi_oversold': rsi_oversold
+            })
+            if timeframe == 'daily':
+                if rsi_bullish: tech_score += 0.5
+                if rsi_oversold: tech_score += 0.5
+            slowk, slowd = talib.STOCH(high, low, close)
+            stoch_bullish_crossover = slowk.iloc[-1] > slowd.iloc[-1] and slowk.iloc[-2] <= slowd.iloc[-2]
+            stoch_oversold = slowk.iloc[-1] < 20 and slowd.iloc[-1] < 20
+            signals[timeframe].update({
+                'stoch_k': slowk.iloc[-1],
+                'stoch_d': slowd.iloc[-1],
+                'stoch_bullish_crossover': stoch_bullish_crossover,
+                'stoch_oversold': stoch_oversold
+            })
+            if timeframe == 'daily' and stoch_bullish_crossover: tech_score += 1
+            upper, middle, lower = talib.BBANDS(close, timeperiod=20)
+            bb_width = (upper.iloc[-1] - lower.iloc[-1]) / middle.iloc[-1]
+            bb_squeeze = bb_width < talib.SMA((upper - lower) / middle, timeperiod=20).iloc[-1] * 0.85
+            bb_breakout_up = close.iloc[-1] > upper.iloc[-1] and close.iloc[-2] <= upper.iloc[-2]
+            signals[timeframe].update({
+                'bb_width': bb_width,
+                'bb_squeeze': bb_squeeze,
+                'bb_breakout_up': bb_breakout_up,
+                'bb_percent_b': (close.iloc[-1] - lower.iloc[-1]) / (upper.iloc[-1] - lower.iloc[-1])
+            })
+            if timeframe == 'daily':
+                if bb_squeeze: tech_score += 0.5
+                if bb_breakout_up: tech_score += 1
+            obv = talib.OBV(close, volume)
+            obv_increasing = obv.iloc[-1] > obv.iloc[-20:].mean()
+            signals[timeframe]['obv_increasing'] = obv_increasing
+            if timeframe == 'daily' and obv_increasing: tech_score += 1
+            adl = talib.AD(high, low, close, volume)
+            adl_increasing = adl.iloc[-1] > adl.iloc[-20:].mean()
+            signals[timeframe]['adl_increasing'] = adl_increasing
+            if timeframe == 'daily' and adl_increasing: tech_score += 1
+            cmf_period = min(20, len(df) - 1)
+            mf_multiplier = ((close.iloc[-cmf_period:] - low.iloc[-cmf_period:]) - (high.iloc[-cmf_period:] - close.iloc[-cmf_period:])) / (high.iloc[-cmf_period:] - low.iloc[-cmf_period:])
+            mf_volume = mf_multiplier * volume.iloc[-cmf_period:]
+            cmf = mf_volume.sum() / volume.iloc[-cmf_period:].sum()
+            signals[timeframe].update({'cmf': cmf, 'cmf_positive': cmf > 0})
+            if timeframe == 'daily' and cmf > 0: tech_score += 1
+        technical_rating = (
+            "Very Bullish" if tech_score >= 10 else
+            "Bullish" if tech_score >= 7 else
+            "Neutral" if tech_score >= 4 else
+            "Bearish" if tech_score >= 2 else
+            "Very Bearish"
+        )
+        support_resistance = calculate_pivot_points(data.get('daily', pd.DataFrame())) if 'daily' in data else {}
+        return {
+            'ticker': ticker,
+            'technical_score': tech_score,
+            'max_score': max_score,
+            'technical_rating': technical_rating,
+            'signals': signals,
+            'support_resistance': support_resistance
+        }
+    except Exception as e:
+        logger.error(f"Error in technical analysis for {ticker}: {e}")
+        return {
+            'ticker': ticker,
+            'technical_score': 0,
+            'max_score': 14,
+            'technical_rating': "Error",
+            'signals': {},
+            'support_resistance': {}
+        }
+
+def calculate_pivot_points(df):
+    try:
+        if df.empty:
+            return {}
+        high = df['High'].max()
+        low = df['Low'].min()
+        close = df['Close'].iloc[-1]
+        pp = (high + low + close) / 3
+        s1, s2, s3 = (2 * pp) - high, pp - (high - low), low - 2 * (high - pp)
+        r1, r2, r3 = (2 * pp) - low, pp + (high - low), high + 2 * (pp - low)
+        return {
+            'current_price': close,
+            'pivot': pp,
+            'supports': [s1, s2, s3],
+            'resistances': [r1, r2, r3]
+        }
+    except Exception as e:
+        logger.error(f"Error calculating pivot points: {e}")
+        return {}
+
+def detect_unusual_options_activity(ticker):
+    """
+    Detect unusual options activity for a given ticker symbol.
+    Basic implementation to analyze volume and open interest.
+    """
+    try:
+        from data import get_options_chain_data, get_cache_timestamp
+        options_data = get_options_chain_data(ticker, get_cache_timestamp())
+        if not options_data:
+            return {
+                'unusual_score': 0,
+                'assessment': 'No options data available',
+                'unusual_activity': []
+            }
+        unusual_activity = []
+        total_score = 0
+        for expiry, chain in options_data.items():
+            for option_type in ['calls', 'puts']:
+                df = pd.DataFrame(chain[option_type])
+                if df.empty or 'volume' not in df.columns or 'openInterest' not in df.columns:
+                    continue
+                df['vol_oi_ratio'] = df['volume'] / df['openInterest'].replace(0, 1)
+                unusual = df[df['vol_oi_ratio'] > 5]  # Threshold for unusual activity
+                for _, row in unusual.iterrows():
+                    unusual_activity.append({
+                        'type': option_type[:-1],  # 'call' or 'put'
+                        'strike': row['strike'],
+                        'expiration': expiry,
+                        'volume': row['volume'],
+                        'open_interest': row['openInterest'],
+                        'vol_oi_ratio': row['vol_oi_ratio']
+                    })
+                    total_score += min(row['vol_oi_ratio'] / 5, 2)  # Cap contribution per strike
+        assessment = (
+            'Significant unusual activity detected' if total_score > 3 else
+            'Moderate unusual activity' if total_score > 1 else
+            'No significant unusual options activity'
+        )
+        return {
+            'unusual_score': min(total_score, 10),  # Max score of 10
+            'assessment': assessment,
+            'unusual_activity': unusual_activity
+        }
+    except Exception as e:
+        logger.error(f"Error detecting options activity for {ticker}: {e}")
+        return {
+            'unusual_score': 0,
+            'assessment': 'Error detecting options activity',
+            'unusual_activity': []
+        }
+
+================
+File: api.py
+================
+import time
+import json
+import html
+import re
+from functools import lru_cache
+from config import RATE_LIMITS, ANTHROPIC_TOKEN_LIMIT, client, anthropic_client, deepseek_client, logger
+from collections import deque
+from threading import Lock
+import datetime
+
+# Rate limiting variables
+daily_request_counts = {model: 0 for model in RATE_LIMITS}
+last_request_date = datetime.date.today()
+MODEL_REQUEST_TIMES = {model: deque() for model in RATE_LIMITS}
+anthropic_token_tracker = deque()
+anthropic_lock = Lock()
+
+def rate_limit(model):
+    if model not in MODEL_REQUEST_TIMES:
+        return
+    now = time.time()
+    while MODEL_REQUEST_TIMES[model] and MODEL_REQUEST_TIMES[model][0] < now - 60:
+        MODEL_REQUEST_TIMES[model].popleft()
+    if len(MODEL_REQUEST_TIMES[model]) >= RATE_LIMITS[model]['MAX_RPM']:
+        wait_until = MODEL_REQUEST_TIMES[model][0] + 60
+        sleep_time = wait_until - now
+        if sleep_time > 0:
+            logger.info(f"Rate limit reached for {model}. Sleeping for {sleep_time:.2f} seconds.")
+            time.sleep(sleep_time)
+    MODEL_REQUEST_TIMES[model].append(time.time())
+
+def check_rate_limits(model):
+    global daily_request_counts, last_request_date
+    current_date = datetime.date.today()
+    if current_date != last_request_date:
+        daily_request_counts = {m: 0 for m in RATE_LIMITS}
+        last_request_date = current_date
+    if daily_request_counts[model] >= RATE_LIMITS[model]['MAX_RPD']:
+        now = datetime.datetime.now()
+        tomorrow = datetime.datetime.combine(current_date + datetime.timedelta(days=1), datetime.time.min)
+        sleep_seconds = (tomorrow - now).total_seconds()
+        logger.warning(f"Daily limit reached for {model}. Sleeping for {int(sleep_seconds)}s")
+        time.sleep(sleep_seconds)
+        daily_request_counts[model] = 0
+        last_request_date = current_date
+
+def clean_response_text(response_text: str) -> str:
+    try:
+        response_text = response_text.strip()
+        response_text = html.unescape(response_text)
+        response_text = re.sub(r'[\x00-\x1F\x7F]', '', response_text)
+        if response_text.startswith("```json"):
+            response_text = response_text[len("```json"):].strip()
+        if response_text.endswith("```"):
+            response_text = response_text[:-3].strip()
+        return response_text
+    except Exception as e:
+        logger.error(f"Error in clean_response_text: {e}")
+        raise
+
+# REMOVED lru_cache decorator to fix unhashable list error
+def robust_api_call(models, prompt, config=None, max_tokens=4000, thinking_budget=None, retries=3, initial_delay=2):
+    if isinstance(models, str):
+        models = [models]
+    for model in models:
+        for attempt in range(retries):
+            try:
+                rate_limit(model)
+                if model == "deepseek-reasoner":
+                    if deepseek_client is None:
+                        raise ValueError("Deepseek client is not initialized")
+                    check_rate_limits(model)
+                    daily_request_counts[model] += 1
+                    response = deepseek_client.chat.completions.create(
+                        model=model,
+                        messages=[{"role": "user", "content": prompt}],
+                        max_tokens=max_tokens,
+                        temperature=1,
+                    )
+                    response_text = response.choices[0].message.content
+                    response_text = clean_response_text(response_text)
+                    try:
+                        parsed = json.loads(response_text)
+                        return True, parsed
+                    except json.JSONDecodeError:
+                        logger.error(f"DeepSeek returned invalid JSON: {response_text}")
+                        return False, response_text
+                elif model.startswith("claude-"):
+                    with anthropic_lock:
+                        now = time.time()
+                        while anthropic_token_tracker and anthropic_token_tracker[0][0] < now - 60:
+                            anthropic_token_tracker.popleft()
+                        current_total = sum(tokens for _, tokens in anthropic_token_tracker)
+                        if current_total + max_tokens > ANTHROPIC_TOKEN_LIMIT:
+                            if anthropic_token_tracker:
+                                oldest_time = anthropic_token_tracker[0][0]
+                                sleep_time = (oldest_time + 60) - now
+                                if sleep_time > 0:
+                                    logger.info(f"Token limit near for {model}, sleeping for {sleep_time:.2f} seconds")
+                                    time.sleep(sleep_time)
+                            else:
+                                logger.error(f"Single request exceeds token limit: max_tokens={max_tokens}")
+                                return False, None
+                        check_rate_limits(model)
+                        daily_request_counts[model] += 1
+                        if thinking_budget is None:
+                            thinking_budget = max(1024, max_tokens - 1000)
+                        else:
+                            if thinking_budget >= max_tokens:
+                                raise ValueError(f"thinking_budget ({thinking_budget}) must be less than max_tokens ({max_tokens})")
+                        thinking_params = {"type": "enabled", "budget_tokens": thinking_budget}
+                        message = anthropic_client.messages.create(
+                            model=model,
+                            max_tokens=max_tokens,
+                            temperature=1,
+                            thinking=thinking_params,
+                            messages=[{"role": "user", "content": prompt}]
+                        )
+                        for block in message.content:
+                            if block.type == "text":
+                                response_text = block.text
+                                break
+                        else:
+                            raise ValueError("No text content block found")
+                        actual_tokens = message.usage.output_tokens
+                        anthropic_token_tracker.append((time.time(), actual_tokens))
+                        logger.info(f"Used {actual_tokens} output tokens for {model}")
+                    response_text = clean_response_text(response_text)
+                    try:
+                        parsed = json.loads(response_text)
+                        return True, parsed
+                    except json.JSONDecodeError:
+                        return False, response_text
+                else:
+                    check_rate_limits(model)
+                    daily_request_counts[model] += 1
+                    
+                    # Check if config contains Google Search tool
+                    has_search_tool = False
+                    if config and 'tools' in config:
+                        for tool in config['tools']:
+                            if 'google_search' in tool:
+                                has_search_tool = True
+                                break
+                    
+                    # Process the config for Gemini API
+                    gemini_config = None
+                    if config:
+                        gemini_config = {}
+                        if 'response_mime_type' in config:
+                            gemini_config['response_mime_type'] = config['response_mime_type']
+                        
+                        # Handle Google Search as a tool
+                        if has_search_tool:
+                            from google.genai.types import Tool, GoogleSearch
+                            tools = []
+                            for tool_config in config['tools']:
+                                if 'google_search' in tool_config:
+                                    tools.append(Tool(google_search=GoogleSearch()))
+                            if tools:
+                                gemini_config['tools'] = tools
+                        
+                        # Copy other configs if needed
+                        if 'response_modalities' in config:
+                            gemini_config['response_modalities'] = config['response_modalities']
+                    
+                    # Generate content with appropriate config
+                    if gemini_config:
+                        from google.genai.types import GenerateContentConfig
+                        generate_config = GenerateContentConfig(**gemini_config)
+                        response = client.models.generate_content(model=model, contents=prompt, config=generate_config)
+                    else:
+                        response = client.models.generate_content(model=model, contents=prompt)
+                    
+                    # Process grounding metadata if available
+                    if hasattr(response, 'candidates') and response.candidates:
+                        candidate = response.candidates[0]
+                        if hasattr(candidate, 'grounding_metadata') and candidate.grounding_metadata:
+                            logger.info(f"Response includes grounding metadata from Google Search")
+                    
+                    response_text = clean_response_text(response.text)
+                    try:
+                        parsed = json.loads(response_text)
+                        if hasattr(response, 'usage_metadata'):
+                            logger.info(f"Used {response.usage_metadata.total_token_count} tokens for {model}")
+                        return True, parsed
+                    except json.JSONDecodeError:
+                        if 'response_mime_type' in config and config['response_mime_type'] == 'application/json':
+                            logger.error(f"Gemini returned invalid JSON: {response_text}")
+                        return False, response_text
+            except Exception as e:
+                logger.error(f"Attempt {attempt + 1} failed for {model}: {e}")
+                if attempt < retries - 1:
+                    delay = initial_delay * (2 ** attempt)
+                    time.sleep(delay)
+                else:
+                    continue
+    fallback_model = "gemini-2.0-flash"
+    logger.warning(f"All reasoning models failed. Falling back to {fallback_model}")
+    try:
+        rate_limit(fallback_model)
+        check_rate_limits(fallback_model)
+        daily_request_counts[fallback_model] += 1
+        response = client.models.generate_content(model=fallback_model, contents=prompt)
+        response_text = clean_response_text(response.text)
+        parsed = json.loads(response_text)
+        if hasattr(response, 'usage_metadata'):
+            logger.info(f"Used {response.usage_metadata.total_token_count} tokens for {fallback_model}")
+        return True, parsed
+    except Exception as e:
+        logger.error(f"Fallback to {fallback_model} failed: {e}")
+        return False, None
+
+def parse_market_events_text(text):
+    """Parse market events text when JSON parsing fails"""
+    events = []
+    market_risk = 'low'
+    lines = text.split('\n')
+    in_events_section = False
+    for line in lines:
+        if line.startswith('# Market-Moving Events'):
+            continue
+        if line.startswith('## Key Events'):
+            in_events_section = True
+            continue
+        if line.startswith('## Market Risk Assessment'):
+            in_events_section = False
+            risk_match = re.search(r'\*\*(\w+)\*\*', line)
+            if risk_match:
+                market_risk = risk_match.group(1).lower()
+            continue
+        if in_events_section and line.strip():
+            events.append(line.strip())
+    return {'events': events, 'market_risk': market_risk}
+
+def check_market_events(model):
+    """
+    Check for significant market-moving events in the past 24 hours.
+    Uses Google Search grounding when available for more accurate and up-to-date information.
+    
+    Args:
+        model: The model to use for market event detection
+        
+    Returns:
+        Dict with 'events' (list of strings) and 'market_risk' (string)
+    """
+    prompt = (
+        "What are the most significant market-moving events in the past 24 hours? "
+        "Focus on Fed announcements, economic data releases, geopolitical events, "
+        "or other factors that could significantly impact stock prices. "
+        "Rate the market risk as low, medium, or high. "
+        "Please provide the response in JSON format with keys 'events' (list of strings) and 'market_risk' (string)."
+    )
+    
+    # Try with Google Search grounding first
+    try:
+        from google.genai.types import Tool, GoogleSearch
+        google_search_config = {
+            'response_mime_type': 'application/json',
+            'tools': [{'google_search': {}}],
+            'response_modalities': ["TEXT"],
+        }
+        
+        success, response = robust_api_call([model], prompt, google_search_config)
+        if success and isinstance(response, dict):
+            events = response.get('events', [])
+            # Ensure events is a list
+            if not isinstance(events, list):
+                events = [str(events)] if events else []
+            market_risk = response.get('market_risk', 'low')
+            logger.info(f"Market events check completed with Google Search grounding: {len(events)} events, risk: {market_risk}")
+            return {'events': events, 'market_risk': market_risk}
+    except Exception as e:
+        logger.warning(f"Failed to use Google Search grounding for market events: {e}")
+    
+    # Fallback to standard call
+    try:
+        success, response = robust_api_call([model], prompt)
+        if success:
+            events = response.get('events', [])
+            # Ensure events is a list
+            if not isinstance(events, list):
+                events = [str(events)] if events else []
+            market_risk = response.get('market_risk', 'low')
+        else:
+            if response:
+                parsed = parse_market_events_text(response)
+                events = parsed['events']
+                market_risk = parsed['market_risk']
+            else:
+                logger.error("Failed to get market events")
+                events = []
+                market_risk = 'low'
+    except Exception as e:
+        logger.error(f"Error in market events check: {e}")
+        events = []
+        market_risk = 'low'
+    
+    return {'events': events, 'market_risk': market_risk}
+
+================
+File: backtest.py
+================
+import json
+import os
+import datetime
+import re
+from config import BACKTEST_DIR, ENABLE_BACKTESTING, logger
+from data import get_current_price
+
+def simulate_trade_performance(ticker, strategy, days_to_monitor=10):
+    try:
+        if not ENABLE_BACKTESTING:
+            return None
+        current_price = get_current_price(ticker)
+        if current_price is None or current_price <= 0:
+            logger.error(f"Cannot simulate trade for {ticker}: no valid current price")
+            return None
+        strategy_type = strategy.get('type', 'unknown')
+        is_bullish = strategy_type.startswith('bullish')
+        backtest_record = {
+            'ticker': ticker,
+            'strategy_type': strategy_type,
+            'entry_date': datetime.datetime.now().isoformat(),
+            'entry_price': current_price,
+            'is_bullish': is_bullish,
+            'target_price': None,
+            'stop_price': None,
+            'daily_results': [],
+            'final_result': None,
+            'max_gain': 0,
+            'max_loss': 0,
+            'hit_target': False,
+            'hit_stop': False
+        }
+        
+        # Improved price extraction with regex
+        try:
+            target_text = strategy.get('target', '')
+            target_match = re.search(r'\$(\d+\.\d+)', target_text)
+            if target_match:
+                backtest_record['target_price'] = float(target_match.group(1))
+                
+            stop_text = strategy.get('stop_loss', '')
+            stop_match = re.search(r'\$(\d+\.\d+)', stop_text)
+            if stop_match:
+                backtest_record['stop_price'] = float(stop_match.group(1))
+                
+        except (ValueError, AttributeError) as e:
+            logger.warning(f"Could not parse target/stop prices for {ticker}: {e}")
+            
+        backtest_file = os.path.join(BACKTEST_DIR, f"{ticker}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+        with open(backtest_file, "w") as f:
+            json.dump(backtest_record, f, indent=4)
+        logger.info(f"Initialized backtest for {ticker}")
+        return backtest_record
+    except Exception as e:
+        logger.error(f"Error simulating trade performance for {ticker}: {e}")
+        return None
+
+def update_backtests():
+    if not ENABLE_BACKTESTING:
+        return
+    try:
+        backtest_files = [f for f in os.listdir(BACKTEST_DIR) if f.endswith('.json')]
+        updated = 0
+        for file in backtest_files:
+            file_path = os.path.join(BACKTEST_DIR, file)
+            try:
+                with open(file_path, "r") as f:
+                    backtest = json.load(f)
+            except json.JSONDecodeError as e:
+                logger.error(f"Error reading {file}: {e}")
+                continue
+            if backtest.get('final_result') is not None:
+                continue
+            ticker = backtest.get('ticker')
+            current_price = get_current_price(ticker)
+            if current_price is None or current_price <= 0:
+                logger.warning(f"Skipping backtest update for {ticker}: no valid current price")
+                continue
+            entry_price = backtest.get('entry_price')
+            target_price = backtest.get('target_price')
+            stop_price = backtest.get('stop_price')
+            is_bullish = backtest.get('is_bullish')
+            if entry_price <= 0:
+                logger.warning(f"Invalid entry price for {ticker}: {entry_price}")
+                continue
+            percent_change = ((current_price - entry_price) / entry_price * 100) if is_bullish else ((entry_price - current_price) / entry_price * 100)
+            hit_target = target_price and (current_price >= target_price if is_bullish else current_price <= target_price)
+            hit_stop = stop_price and (current_price <= stop_price if is_bullish else current_price >= stop_price)
+            max_gain = max(backtest.get('max_gain', 0), percent_change if percent_change > 0 else 0)
+            max_loss = min(backtest.get('max_loss', 0), percent_change if percent_change < 0 else 0)
+            daily_results = backtest.get('daily_results', [])
+            daily_results.append({
+                'date': datetime.datetime.now().isoformat(),
+                'price': current_price,
+                'percent_change': percent_change
+            })
+            entry_date = datetime.datetime.fromisoformat(backtest.get('entry_date'))
+            days_elapsed = (datetime.datetime.now() - entry_date).days
+            is_complete = days_elapsed >= 10 or hit_target or hit_stop
+            backtest.update({
+                'daily_results': daily_results,
+                'max_gain': max_gain,
+                'max_loss': max_loss,
+                'hit_target': hit_target,
+                'hit_stop': hit_stop
+            })
+            if is_complete:
+                backtest.update({
+                    'final_result': percent_change,
+                    'final_price': current_price,
+                    'close_date': datetime.datetime.now().isoformat(),
+                    'close_reason': 'target_hit' if hit_target else 'stop_hit' if hit_stop else 'time_elapsed'
+                })
+            with open(file_path, "w") as f:
+                json.dump(backtest, f, indent=4)
+            updated += 1
+            if is_complete:
+                logger.info(f"Completed backtest for {ticker}: {percent_change:.2f}% ({backtest['close_reason']})")
+        if updated > 0:
+            logger.info(f"Updated {updated} backtest records")
+    except Exception as e:
+        logger.error(f"Error in backtest update: {e}")
+
+================
+File: config.py
+================
+import os
+import logging
+import google.genai as genai
+import anthropic
+from openai import OpenAI
+
+# Logging Configuration
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Paths
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+RECOMMENDATIONS_DIR = os.path.join(SCRIPT_DIR, "recommendations")
+PROCESSED_FILE = os.path.join(SCRIPT_DIR, "processed_articles.json")
+STATS_FILE = os.path.join(SCRIPT_DIR, "daily_stats.json")
+WATCHLIST_FILE = os.path.join(SCRIPT_DIR, "watchlist.json")
+BACKTEST_DIR = os.path.join(SCRIPT_DIR, "backtest_results")
+
+# Ensure directories exist
+os.makedirs(RECOMMENDATIONS_DIR, exist_ok=True)
+os.makedirs(os.path.join(RECOMMENDATIONS_DIR, "by_ticker"), exist_ok=True)
+os.makedirs(BACKTEST_DIR, exist_ok=True)
+
+# API Configuration
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY environment variable is not set")
+
+ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
+if not ANTHROPIC_API_KEY:
+    raise ValueError("ANTHROPIC_API_KEY environment variable is not set")
+
+DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')
+if not DEEPSEEK_API_KEY:
+    logger.warning("DEEPSEEK_API_KEY environment variable is not set")
+
+# Model Configuration
+USE_SONNET_FOR_THINKING = True
+MODEL_ANALYSIS = "gemini-2.0-flash"
+MODEL_THINKING = "claude-3-7-sonnet-20250219" if USE_SONNET_FOR_THINKING else "gemini-2.0-flash"
+MODEL_TICKER = "gemini-2.0-flash"  # Using Gemini 2.0 Flash for ticker extraction with grounding
+MODEL_JSON = MODEL_ANALYSIS
+
+# Single run mode flag (for command-line control)
+SINGLE_RUN_MODE = len(os.sys.argv) > 1 and os.sys.argv[1] == "--single-run"
+
+# Initialize API clients
+client = genai.Client(api_key=GEMINI_API_KEY)
+anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+deepseek_client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com") if DEEPSEEK_API_KEY else None
+
+# RSS Feed URLs
+FEED_URLS = [
+    "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFpRXEMGSQ5STlFQGEZdE0RPAwoBThFNXBBdVVM=",
+    "https://rss.app/feeds/_kbmkWNuMUCeQeZ29.xml",
+    "https://www.prnewswire.com/rss/news-releases-list.rss",
+    "https://www.prnewswire.com/rss/all-news-releases-from-PR-newswire-news.rss",
+    "https://news.alphastreet.com/feed/",
+    "https://www.investors.com/category/news/rss/",
+    "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
+    "https://feeds.content.dowjones.io/public/rss/mw_topstories",
+    "https://www.investing.com/rss/news.rss",
+    "https://www.marketwatch.com/rss/news/market","https://seekingalpha.com/market_currents.xml","https://www.ino.com/blog/feed/",
+]
+
+# Configuration Options
+MIN_OVERALL_SCORE = 6.0
+PARALLELISM = 4
+ENABLE_BACKTESTING = False
+BATCH_SIZE = 20
+ANTHROPIC_TOKEN_LIMIT = 8000  # tokens per minute
+
+# Rate Limits
+RATE_LIMITS = {
+    MODEL_ANALYSIS: {'MAX_RPM': 30, 'MAX_RPD': 1500},
+    MODEL_THINKING: {'MAX_RPM': 10, 'MAX_RPD': 500},
+    MODEL_TICKER: {'MAX_RPM': 30, 'MAX_RPD': 1500},
+    MODEL_JSON: {'MAX_RPM': 30, 'MAX_RPD': 1500},
+    "deepseek-reasoner": {'MAX_RPM': 1000, 'MAX_RPD': 100000},
+    "gemini-2.0-flash-thinking-exp-01-21": {'MAX_RPM': 30, 'MAX_RPD': 1500},
+    "claude-3-7-sonnet-20250219": {'MAX_RPM': 10, 'MAX_RPD': 500},
+    "gemini-2.0-flash": {'MAX_RPM': 30, 'MAX_RPD': 1500}
+}
+
+================
+File: daily_stats.json
+================
+{}
+
+================
+File: data.py
+================
+import feedparser
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import datetime
+import time
+from functools import lru_cache
+from config import logger
+
+def fetch_full_text(entry):
+    return entry.get("content", [{"value": ""}])[0].get("value", "") or entry.get("summary", "")[:2000]
+
+@lru_cache(maxsize=1000)
+def is_valid_ticker(ticker):
+    try:
+        ticker_obj = yf.Ticker(ticker)
+        history = ticker_obj.history(period="1d")
+        return not history.empty and 'Close' in history.columns and not history['Close'].isna().all()
+    except Exception as e:
+        logger.warning(f"Ticker validation failed for {ticker}: {e}")
+        return False
+
+def get_current_price(ticker, retries=3, delay=2):
+    for attempt in range(retries):
+        try:
+            ticker_obj = yf.Ticker(ticker)
+            history = ticker_obj.history(period="5d")
+            if history.empty or 'Close' not in history.columns:
+                logger.warning(f"No data for {ticker} on attempt {attempt + 1}")
+                if attempt < retries - 1:
+                    time.sleep(delay)
+                continue
+            for i in range(len(history) - 1, -1, -1):
+                close_price = history['Close'].iloc[i]
+                if not pd.isna(close_price) and close_price > 0:
+                    logger.info(f"Fetched valid price ${close_price:.2f} for {ticker} from {history.index[i].date()}")
+                    return close_price
+            logger.warning(f"No valid close price found for {ticker}")
+            return None
+        except Exception as e:
+            logger.error(f"Error fetching price for {ticker} on attempt {attempt + 1}: {e}")
+            if attempt < retries - 1:
+                time.sleep(delay)
+    logger.error(f"Failed to fetch price for {ticker} after {retries} attempts")
+    return None
+
+def get_cache_timestamp():
+    return int(datetime.datetime.now().timestamp() // 3600)
+
+@lru_cache(maxsize=100)
+def get_stock_data(ticker: str, cache_timestamp: int) -> dict:
+    try:
+        stock = yf.Ticker(ticker)
+        data = stock.info
+        hist = stock.history(period="60d")
+        if not hist.empty and len(hist) > 20:
+            data['historical_volatility'] = hist['Close'].pct_change().std() * np.sqrt(252) * 100
+        return data if data and 'currentPrice' in data else {}
+    except Exception as e:
+        logger.error(f"Error fetching stock data for {ticker}: {e}")
+        return {}
+
+@lru_cache(maxsize=100)
+def get_options_chain_data(ticker: str, cache_timestamp: int) -> dict:
+    try:
+        ticker_obj = yf.Ticker(ticker)
+        expiration_dates = ticker_obj.options[:5]
+        if not expiration_dates:
+            return {}
+        options_data = {}
+        for expiry in expiration_dates:
+            chain = ticker_obj.option_chain(expiry)
+            calls_df = chain.calls.copy()
+            puts_df = chain.puts.copy()
+            expiry_date = datetime.datetime.strptime(expiry, '%Y-%m-%d')
+            days_to_expiry = (expiry_date - datetime.datetime.now()).days
+            stock_price = get_current_price(ticker)
+            if stock_price is None:
+                continue
+            for df in [calls_df, puts_df]:
+                df['theta_per_day'] = (df['lastPrice'] * 0.1) / max(days_to_expiry, 1)
+                if 'calls' in df.columns:
+                    df['breakeven'] = df['strike'] + df['lastPrice']
+                else:
+                    df['breakeven'] = df['strike'] - df['lastPrice']
+                df['pct_to_breakeven'] = abs((df['breakeven'] - stock_price) / stock_price * 100)
+            options_data[expiry] = {
+                "calls": calls_df.to_dict(orient="records"),
+                "puts": puts_df.to_dict(orient="records")
+            }
+        return options_data
+    except Exception as e:
+        logger.error(f"Error fetching options data for {ticker}: {e}")
+        return {}
+
+def get_company_fundamentals(ticker):
+    try:
+        stock = yf.Ticker(ticker)
+        income_stmt = stock.income_stmt
+        balance_sheet = stock.balance_sheet
+        cashflow = stock.cashflow
+        if not income_stmt.empty and not balance_sheet.empty:
+            recent_yr = income_stmt.columns[0]
+            prev_yr = income_stmt.columns[1] if len(income_stmt.columns) > 1 else None
+            revenue = income_stmt.loc['TotalRevenue', recent_yr] if 'TotalRevenue' in income_stmt.index else None
+            revenue_growth = ((revenue / income_stmt.loc['TotalRevenue', prev_yr]) - 1) * 100 if prev_yr and revenue else None
+            net_income = income_stmt.loc['NetIncome', recent_yr] if 'NetIncome' in income_stmt.index else None
+            profit_margin = (net_income / revenue) * 100 if revenue and net_income else None
+            total_assets = balance_sheet.loc['TotalAssets', recent_yr] if 'TotalAssets' in balance_sheet.index else None
+            total_debt = balance_sheet.loc['TotalDebt', recent_yr] if 'TotalDebt' in balance_sheet.index else None
+            cash = balance_sheet.loc['Cash', recent_yr] if 'Cash' in balance_sheet.index else None
+            debt_to_assets = (total_debt / total_assets) if total_assets and total_debt else None
+            operating_cf = cashflow.loc['OperatingCashFlow', recent_yr] if not cashflow.empty and 'OperatingCashFlow' in cashflow.index else None
+            fcf = operating_cf - cashflow.loc['CapitalExpenditures', recent_yr] if not cashflow.empty and 'CapitalExpenditures' in cashflow.index and operating_cf else None
+            info = stock.info
+            market_cap = info.get('marketCap')
+            beta = info.get('beta')
+            pe_ratio = info.get('trailingPE')
+            forward_pe = info.get('forwardPE')
+            dividend_yield = info.get('dividendYield', 0) * 100 if info.get('dividendYield') else 0
+            return {
+                "ticker": ticker,
+                "market_cap_billions": round(market_cap / 1e9, 2) if market_cap else None,
+                "revenue_billions": round(revenue / 1e9, 2) if revenue else None,
+                "revenue_growth_pct": round(revenue_growth, 2) if revenue_growth else None,
+                "profit_margin_pct": round(profit_margin, 2) if profit_margin else None,
+                "pe_ratio": round(pe_ratio, 2) if pe_ratio else None,
+                "forward_pe": round(forward_pe, 2) if forward_pe else None,
+                "debt_to_assets": round(debt_to_assets, 2) if debt_to_assets else None,
+                "cash_billions": round(cash / 1e9, 2) if cash else None,
+                "free_cash_flow_billions": round(fcf / 1e9, 2) if fcf else None,
+                "dividend_yield_pct": round(dividend_yield, 2),
+                "beta": round(beta, 2) if beta else None
+            }
+    except Exception as e:
+        logger.error(f"Error getting fundamentals for {ticker}: {e}")
+    return {}
+
+def get_market_context():
+    try:
+        spy = yf.Ticker("SPY")
+        qqq = yf.Ticker("QQQ")
+        vix = yf.Ticker("^VIX")
+        spy_data = spy.history(period="60d")
+        qqq_data = qqq.history(period="60d")
+        vix_data = vix.history(period="60d")
+        if spy_data.empty or qqq_data.empty or vix_data.empty:
+            logger.warning("Market context data is empty")
+            return {}
+        spy_current = spy_data["Close"].iloc[-1]
+        qqq_current = qqq_data["Close"].iloc[-1]
+        vix_current = vix_data["Close"].iloc[-1]
+        import talib  # Import here to avoid circular dependencies with analysis.py
+        spy_sma20 = talib.SMA(spy_data["Close"], timeperiod=20).iloc[-1]
+        spy_sma50 = talib.SMA(spy_data["Close"], timeperiod=50).iloc[-1]
+        qqq_sma20 = talib.SMA(qqq_data["Close"], timeperiod=20).iloc[-1]
+        spy_rsi = talib.RSI(spy_data["Close"], timeperiod=14).iloc[-1]
+        market_trend = (
+            "strongly bullish" if spy_current > spy_sma20 and spy_sma20 > spy_sma50 else
+            "bullish" if spy_current > spy_sma20 else
+            "strongly bearish" if spy_current < spy_sma20 and spy_sma20 < spy_sma50 else
+            "bearish" if spy_current < spy_sma20 else
+            "neutral"
+        )
+        vix_sma20 = talib.SMA(vix_data["Close"], timeperiod=20).iloc[-1]
+        volatility = (
+            "very low" if vix_current < 15 else
+            "low" if vix_current < 20 else
+            "moderate" if vix_current < 30 else
+            "high" if vix_current < 40 else
+            "extreme"
+        )
+        return {
+            "spy_price": spy_current,
+            "spy_change_1d": ((spy_current / spy_data["Close"].iloc[-2]) - 1) * 100,
+            "spy_rsi": spy_rsi,
+            "trend": market_trend,
+            "vix": vix_current,
+            "volatility": volatility,
+            "volatility_trend": "increasing" if vix_current > vix_sma20 else "decreasing",
+            "market_breadth": "narrow" if qqq_current / qqq_data["Close"].iloc[-10] > spy_current / spy_data["Close"].iloc[-10] else "broad"
+        }
+    except Exception as e:
+        logger.error(f"Error getting market context: {e}")
+        return {}
+
+def get_extended_market_context():
+    try:
+        market_context = get_market_context()
+        indices = {'DJIA': '^DJI', 'NASDAQ': '^IXIC', 'Russell2000': '^RUT', 'TLT': 'TLT', 'DXY': 'DX-Y.NYB'}
+        for name, symbol in indices.items():
+            try:
+                idx = yf.Ticker(symbol)
+                hist = idx.history(period="5d")
+                if not hist.empty:
+                    market_context[f'{name}_change_1d'] = ((hist['Close'].iloc[-1] / hist['Close'].iloc[-2]) - 1) * 100
+            except Exception as e:
+                logger.warning(f"Error getting {name} data: {e}")
+        return market_context
+    except Exception as e:
+        logger.error(f"Error in extended market context: {e}")
+        return {}
+
+================
+File: feed_debug.txt
+================
+{'bozo': True,
+ 'bozo_exception': URLError(SSLCertVerificationError(1, '[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate (_ssl.c:1000)')),
+ 'entries': [],
+ 'feed': {},
+ 'headers': {}}
+
+================
+File: main.py
+================
+#!/usr/bin/env python3
+import time
+import sys
+import os
+import datetime
+import feedparser
+from config import FEED_URLS, SINGLE_RUN_MODE, RECOMMENDATIONS_DIR, BACKTEST_DIR, PARALLELISM, MIN_OVERALL_SCORE, MODEL_THINKING, logger, BATCH_SIZE, ENABLE_BACKTESTING
+from utils import load_processed_articles, save_processed_articles, load_daily_stats, save_daily_stats, update_watchlist_performance, is_recent
+from data import fetch_full_text
+from analysis import batch_generic_check, batch_analyze_headlines, get_ticker_symbol, analyze_company_context, is_valid_ticker
+from trade import evaluate_trade_opportunity, save_enhanced_recommendation, generate_trade_confidence
+from backtest import update_backtests, simulate_trade_performance
+from api import check_market_events
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+def debug_feeds():
+    """Test parsing each feed to identify issues"""
+    logger.info("Debug mode: Testing feed parsing...")
+    
+    for feed_url in FEED_URLS:
+        try:
+            logger.info(f"Testing feed: {feed_url}")
+            feed = feedparser.parse(feed_url, timeout=15)
+            
+            # Log feed status
+            if hasattr(feed, 'status'):
+                logger.info(f"  Status: {feed.status}")
+            
+            # Log feed bozo (error flag)
+            if hasattr(feed, 'bozo') and feed.bozo:
+                logger.error(f"  Feed parse error: {feed.get('bozo_exception', 'Unknown error')}")
+            
+            # Log entry count
+            logger.info(f"  Entries: {len(feed.entries)}")
+            
+            # Test first entry if available
+            if feed.entries:
+                entry = feed.entries[0]
+                logger.info(f"  First entry title: {entry.get('title', 'No title')}")
+                logger.info(f"  First entry date fields: {[k for k in entry.keys() if 'date' in k.lower() or 'time' in k.lower() or 'pub' in k.lower()]}")
+                
+                if 'pubDate' in entry:
+                    logger.info(f"  pubDate: {entry.pubDate}")
+                
+                # Test is_recent function
+                is_rec = is_recent(entry)
+                logger.info(f"  is_recent result: {is_rec}")
+            else:
+                logger.warning(f"  No entries found in feed")
+        
+        except Exception as e:
+            logger.error(f"Error testing feed {feed_url}: {e}", exc_info=True)
+    
+    logger.info("Feed testing complete")
+
+# Removed local ENABLE_BACKTESTING definition - use the one from config.py instead
+def check_feeds_availability():
+    """Check if the RSS feeds are available and contain entries"""
+    import requests
+    from bs4 import BeautifulSoup
+    
+    logger.info("Checking feed availability...")
+    
+    for feed_url in FEED_URLS:
+        try:
+            # First, check if the URL is accessible
+            response = requests.get(feed_url, timeout=10)
+            
+            if response.status_code != 200:
+                logger.error(f"Feed URL returned status code {response.status_code}: {feed_url}")
+                continue
+                
+            # Check the content
+            content_length = len(response.content)
+            logger.info(f"Feed URL accessible, content length: {content_length} bytes: {feed_url}")
+            
+            # Parse the raw content (bypass feedparser for testing)
+            soup = BeautifulSoup(response.content, 'xml')
+            items = soup.find_all(['item', 'entry'])
+            
+            if items:
+                logger.info(f"Found {len(items)} raw items in feed: {feed_url}")
+                # Print a sample title if available
+                for item in items[:1]:
+                    title_tag = item.find(['title'])
+                    if title_tag:
+                        logger.info(f"Sample title: {title_tag.text}")
+            else:
+                logger.warning(f"No items found in raw feed content: {feed_url}")
+                
+            # Try with feedparser
+            parsed = feedparser.parse(feed_url)
+            
+            # Debug the entire feedparser output for the first feed
+            if feed_url == FEED_URLS[0]:
+                import pprint
+                with open("feed_debug.txt", "w") as f:
+                    f.write(pprint.pformat(parsed))
+                logger.info(f"Wrote complete debug info for first feed to feed_debug.txt")
+                
+            if parsed.entries:
+                logger.info(f"Feedparser found {len(parsed.entries)} entries in feed: {feed_url}")
+            else:
+                logger.warning(f"Feedparser found no entries in feed: {feed_url}")
+                
+        except Exception as e:
+            logger.error(f"Error checking feed {feed_url}: {e}")
+
+def process_feed(processed_articles, daily_stats, run_timestamp):
+    today_str = datetime.date.today().isoformat()
+    batch_items = []
+    for feed_url in FEED_URLS:
+        logger.info(f"Processing feed: {feed_url}")
+        try:
+            # Add timeout to feedparser call
+            feed = feedparser.parse(feed_url, timeout=10)
+            
+            # Check for feedparser errors
+            if hasattr(feed, 'bozo') and feed.bozo:
+                logger.error(f"Feed parse error: {feed.get('bozo_exception', 'Unknown error')}")
+            
+            if not feed.entries:
+                logger.warning(f"No entries found in feed: {feed_url}")
+                # Log feed structure to help diagnose
+                logger.debug(f"Feed structure: {feed.keys()}")
+                if 'feed' in feed:
+                    logger.debug(f"Feed title: {feed.feed.get('title', 'No title')}")
+                continue
+                
+            logger.info(f"Found {len(feed.entries)} entries in feed: {feed_url}")
+            new_articles_found = False
+            
+            for entry in feed.entries:
+                # Log entry structure for debugging
+                if feed.entries.index(entry) == 0:
+                    logger.debug(f"First entry keys: {entry.keys()}")
+                
+                entry_title = entry.get("title", "No title")
+                logger.debug(f"Checking entry: {entry_title[:50]}...")
+                
+                if not is_recent(entry):
+                    logger.debug(f"Entry not recent: {entry_title[:50]}...")
+                    continue
+                    
+                logger.debug(f"Entry is recent: {entry_title[:50]}...")
+                
+                entry_id = entry.get("id", entry.get("link", entry.get("title")))
+                if entry_id in processed_articles:
+                    logger.debug(f"Entry already processed: {entry_title[:50]}...")
+                    continue
+                    
+                processed_articles.add(entry_id)
+                headline = entry.get("title", "").strip()
+                summary = entry.get("summary", "").strip()
+                full_text = fetch_full_text(entry)
+                
+                if headline:
+                    batch_items.append({"headline": headline, "summary": summary, "full_text": full_text})
+                    new_articles_found = True
+                    logger.info(f"Added to batch: {headline[:50]}...")
+                
+                if len(batch_items) >= BATCH_SIZE:
+                    process_batch(batch_items, today_str, run_timestamp, processed_articles, daily_stats)
+                    batch_items = []
+            
+            if batch_items:
+                process_batch(batch_items, today_str, run_timestamp, processed_articles, daily_stats)
+                batch_items = []
+                
+            save_processed_articles(processed_articles)
+            save_daily_stats(daily_stats)
+            logger.info(f"{'New articles found' if new_articles_found else 'No new recent articles'} in {feed_url}")
+        except Exception as e:
+            logger.error(f"Error processing feed {feed_url}: {e}", exc_info=True)
+
+def process_batch(items, today_str, run_timestamp, processed_articles, daily_stats):
+    """Process a batch of news items"""
+    if today_str not in daily_stats:
+        daily_stats[today_str] = {"total": 0, "generic": 0, "failed": 0}
+    
+    daily_stats[today_str]["total"] += len(items)
+    headlines = [item["headline"] for item in items]
+    
+    # First step: Filter out generic headlines
+    generic_classification = batch_generic_check(headlines)
+    non_generic_items = [item for item in items if not generic_classification.get(item["headline"], False)]
+    daily_stats[today_str]["generic"] += len(items) - len(non_generic_items)
+    
+    if not non_generic_items:
+        logger.info("No non-generic items found in this batch")
+        return
+    
+    # Second step: Analyze non-generic headlines
+    logger.info(f"Analyzing {len(non_generic_items)} non-generic headlines")
+    analysis_results = batch_analyze_headlines(non_generic_items)
+    
+    with ThreadPoolExecutor(max_workers=PARALLELISM) as executor:
+        futures = []
+        
+        for item in non_generic_items:
+            headline = item["headline"]
+            
+            if headline not in analysis_results:
+                daily_stats[today_str]["failed"] += 1
+                continue
+                
+            analysis = analysis_results[headline]
+            confidence = analysis.get("confidence", "low").lower().replace(" ", "-")
+            
+            # Track confidence levels in stats
+            if confidence in ['very-high', 'high', 'medium', 'low']:
+                daily_stats[today_str].setdefault(confidence, 0)
+                daily_stats[today_str][confidence] += 1
+                
+            logger.info(
+                f"Analyzed headline: {headline}, Confidence: {confidence}, "
+                f"Catalyst: {analysis.get('market_catalyst')}, Sentiment: {analysis.get('sentiment')} "
+                f"(Score: {analysis.get('sentiment_score')}), Timing: {analysis.get('impact_timing')}, "
+                f"Impact: {analysis.get('price_impact_range')}"
+            )
+            
+            # Only process medium or higher confidence analyses
+            if confidence in ['very-high', 'high', 'medium']:
+                # First try to use ticker from batch analysis
+                ticker = None
+                
+                # Check if analysis already provided a ticker and it's valid
+                if analysis.get('ticker') and analysis.get('ticker') != "null" and is_valid_ticker(analysis.get('ticker')):
+                    ticker = analysis.get('ticker')
+                    logger.info(f"Using ticker {ticker} from batch analysis for '{headline}'")
+                else:
+                    # If not, extract ticker with the improved get_ticker_symbol function
+                    ticker = get_ticker_symbol(headline, analysis.get("analysis", ""))
+                
+                if ticker:
+                    futures.append(executor.submit(process_ticker_analysis, ticker, headline, analysis, item["summary"], run_timestamp))
+                else:
+                    logger.info(f"No valid ticker found for '{headline}'")
+        
+        # Wait for all analysis tasks to complete
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:
+                logger.error(f"Error in parallel processing: {e}")
+
+def process_ticker_analysis(ticker, headline, analysis, summary, run_timestamp):
+    """Process analysis for a specific ticker"""
+    try:
+        from data import get_company_fundamentals  # Avoid circular import
+        
+        # Get fundamental data for the company
+        fundamentals = get_company_fundamentals(ticker)
+        
+        # Analyze how the news relates to company context
+        company_context = analyze_company_context(ticker, headline, analysis.get("analysis", ""), fundamentals)
+        
+        # Evaluate trading opportunity
+        trade_evaluation = evaluate_trade_opportunity(ticker, analysis)
+        trade_evaluation['company_context'] = company_context
+        
+        # Generate trade confidence score
+        trade_evaluation['trade_confidence'] = generate_trade_confidence(
+            ticker, 
+            headline, 
+            analysis, 
+            trade_evaluation.get('factors', {}).get('technical', {}).get('details', {})
+        )
+        
+        # Adjust position size based on company fundamentals if necessary
+        if company_context.get('risk_adjustment') and 'strategy' in trade_evaluation and company_context.get('risk_adjustment') < 0:
+            strategy = trade_evaluation['strategy']
+            pos_size = strategy.get('position_size', '')
+            if '3-5%' in pos_size:
+                strategy['position_size'] = '1-2% of portfolio (reduced due to fundamentals)'
+            elif '2-3%' in pos_size:
+                strategy['position_size'] = '1% of portfolio (reduced due to fundamentals)'
+        
+        # Save recommendation if score meets minimum threshold
+        if trade_evaluation['overall_score'] >= MIN_OVERALL_SCORE:
+            save_enhanced_recommendation(run_timestamp, headline, analysis, summary, trade_evaluation)
+            
+            # Setup backtest if enabled
+            if ENABLE_BACKTESTING and 'strategy' in trade_evaluation:
+                simulate_trade_performance(ticker, trade_evaluation['strategy'])
+        else:
+            logger.info(f"Skipping low-score ({trade_evaluation['overall_score']:.1f}/10) opportunity for {ticker}")
+            
+    except Exception as e:
+        logger.error(f"Error processing ticker analysis for {ticker}: {e}")
+
+def run_maintenance_tasks():
+    """Run periodic maintenance tasks"""
+    try:
+        # Update performance of stocks in watchlist
+        logger.info("Starting watchlist performance update")
+        update_watchlist_performance()
+        
+        # Update backtests if enabled
+        if ENABLE_BACKTESTING:
+            logger.info("Starting backtest update")
+            update_backtests()
+        
+        # Check for significant market events
+        logger.info("Starting market events check")
+        try:
+            events_info = check_market_events(MODEL_THINKING)
+            
+            # Validate the response
+            if not isinstance(events_info, dict):
+                logger.error(f"Invalid market events response: {type(events_info)}")
+                events_info = {'events': [], 'market_risk': 'low'}
+                
+            market_risk = events_info.get('market_risk', 'low')
+            
+            # Adjust trading threshold if market risk is elevated
+            if market_risk in ['medium', 'high']:
+                for event in events_info.get('events', []):
+                    logger.warning(f"Market event detected: {event}")
+                    
+                if market_risk == 'high':
+                    global MIN_OVERALL_SCORE
+                    MIN_OVERALL_SCORE = min(8.0, MIN_OVERALL_SCORE + 1.0)
+                    logger.warning(f"Increased trading threshold to {MIN_OVERALL_SCORE} due to high market risk")
+        except Exception as e:
+            logger.error(f"Error in market events check: {e}", exc_info=True)
+    except Exception as e:
+        logger.error(f"Error running maintenance tasks: {e}", exc_info=True)
+
+def main():
+    """Main entry point for the trading system"""
+    logger.info("Starting multi-factor newsfeed trading system...")
+    debug_feeds()
+    check_feeds_availability()
+
+    # Ensure directories exist
+    os.makedirs(RECOMMENDATIONS_DIR, exist_ok=True)
+    os.makedirs(os.path.join(RECOMMENDATIONS_DIR, "by_ticker"), exist_ok=True)
+    os.makedirs(BACKTEST_DIR, exist_ok=True)
+    
+    # Run maintenance tasks
+    logger.info("Running maintenance tasks...")
+    run_maintenance_tasks()
+    
+    # Load processed articles and stats
+    processed_articles = load_processed_articles()
+    daily_stats = load_daily_stats()
+    
+    # Create timestamp for this run
+    run_timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    
+    # Process news feeds
+    process_feed(processed_articles, daily_stats, run_timestamp)
+    
+    # Exit if single run mode
+    if SINGLE_RUN_MODE:
+        logger.info("Single run completed. Exiting.")
+        sys.exit(0)
+    
+    # Continue processing in loop
+    while True:
+        try:
+            logger.info("Waiting 5 minutes before next scan...")
+            time.sleep(300)
+            run_maintenance_tasks()
+            run_timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            process_feed(processed_articles, daily_stats, run_timestamp)
+        except Exception as e:
+            logger.error(f"Error in main loop: {e}")
+            logger.info("Waiting 10 minutes before retry due to error...")
+            time.sleep(600)
+
+if __name__ == "__main__":
+    main()
+
+================
+File: processed_articles.json
+================
+[]
+
+================
+File: REAMDE.md
+================
+Multi-Factor Newsfeed Trading System
+This project is a sophisticated trading system that analyzes news headlines from multiple RSS feeds, evaluates their potential impact on stock prices, and generates trading recommendations. It combines news sentiment analysis, technical indicators, and market context, leveraging AI models (such as Google Gemini, Anthropic’s Claude, and optionally DeepSeek) to process data and make informed trading decisions. The system also supports backtesting to evaluate trade performance over time.
+
+The project is organized into modular Python files, each responsible for a specific aspect of the system. This README provides a detailed explanation of each file, its purpose, and its major functions, along with instructions for setup and usage.
+
+Table of Contents
+Project Structure
+File Descriptions
+config.py
+utils.py
+api.py
+data.py
+analysis.py
+trade.py
+backtest.py
+main.py
+How the System Works
+Usage
+Dependencies
+Environment Variables
+Notes
+Project Structure
+The project is structured into the following files, each with a distinct role:
+
+config.py: Centralizes configuration settings, API keys, and constants.
+utils.py: Provides utility functions for data management and time operations.
+api.py: Handles interactions with AI APIs and rate limiting.
+data.py: Manages data retrieval and preprocessing (e.g., stock prices, RSS feeds).
+analysis.py: Conducts headline and technical analysis.
+trade.py: Evaluates trade opportunities and generates strategies.
+backtest.py: Simulates and tracks trade performance.
+main.py: Orchestrates the system as the main entry point.
+This modular design enhances readability, maintainability, and scalability.
+
+File Descriptions
+config.py
+Purpose: Centralizes all configuration settings, including logging, file paths, API keys, and system-wide constants.
+
+Major Components:
+
+Logging Setup: Configures the logging format and level (e.g., INFO, DEBUG).
+File Paths: Defines directories for recommendations, processed articles, daily stats, watchlists, and backtest results.
+API Keys: Loads API keys for Gemini, Anthropic, and (optionally) DeepSeek from environment variables.
+RSS Feeds: Lists URLs of RSS feeds to monitor (e.g., financial news sources).
+Constants: Defines settings like MIN_OVERALL_SCORE (minimum score for a trade recommendation), PARALLELISM (for batch processing), and ENABLE_BACKTESTING.
+Rate Limits: Sets per-minute and daily limits for API calls to prevent quota exhaustion.
+utils.py
+Purpose: Contains helper functions for file I/O, watchlist management, and time-related operations.
+
+Major Functions:
+
+load_processed_articles(): Reads a JSON file containing IDs of already processed articles.
+save_processed_articles(processed_articles): Writes the set of processed article IDs to a JSON file.
+load_daily_stats(): Loads daily statistics (e.g., articles processed) from a JSON file.
+save_daily_stats(daily_stats): Saves updated daily stats to a JSON file.
+load_watchlist(): Retrieves the current watchlist from a JSON file.
+save_watchlist(watchlist): Saves the watchlist to a JSON file.
+add_to_watchlist(ticker, reason, expected_impact, timeframe, score=None): Adds a ticker to the watchlist with details like reason and expected price impact.
+update_watchlist_performance(): Updates watchlist entries with current stock prices and performance metrics.
+is_recent(entry): Checks if an RSS feed entry was published within the last 24 hours.
+api.py
+Purpose: Manages API calls to AI models (Gemini, Claude, DeepSeek) and enforces rate limits.
+
+Major Functions:
+
+rate_limit(model): Ensures API calls stay within per-minute limits for the specified model.
+check_rate_limits(model): Verifies that daily API call limits are not exceeded.
+clean_response_text(response_text): Formats and cleans raw API response text.
+robust_api_call(models, prompt, config=None, max_tokens=4000, thinking_budget=None, retries=3, initial_delay=2): Executes API calls with retry logic and fallback to a default model if errors occur.
+parse_market_events_text(text): Extracts market events and risk levels from API responses.
+check_market_events(model): Queries the AI for significant market-moving events and assesses overall market risk.
+data.py
+Purpose: Fetches and preprocesses data, including stock prices, RSS feed content, and company fundamentals.
+
+Major Functions:
+
+fetch_full_text(entry): Retrieves the full text of an RSS feed entry.
+is_valid_ticker(ticker): Validates a ticker symbol by checking its historical data availability.
+get_current_price(ticker, retries=3, delay=2): Fetches the latest closing price for a ticker with retry logic.
+get_cache_timestamp(): Creates a timestamp for caching data.
+get_stock_data(ticker, cache_timestamp): Retrieves and caches stock info and historical volatility.
+get_options_chain_data(ticker, cache_timestamp): Fetches and caches options chain data.
+get_company_fundamentals(ticker): Gathers financial fundamentals (e.g., P/E ratio, revenue).
+get_market_context(): Collects market data (e.g., S&P 500, NASDAQ, VIX).
+get_extended_market_context(): Adds additional indices (e.g., DJIA, Russell 2000) to market context.
+analysis.py
+Purpose: Analyzes news headlines, sentiment, and stock technicals to inform trading decisions.
+
+Major Functions:
+
+batch_generic_check(headlines, model=MODEL_JSON): Classifies headlines as 'generic' or 'not generic'.
+batch_analyze_headlines(items, model=MODEL_JSON): Analyzes headlines for company mentions, sentiment, and impact timing.
+get_ticker_symbol(headline, analysis_text, model=MODEL_TICKER): Extracts ticker symbols from headlines and analysis.
+analyze_company_context(ticker, headline, analysis_text, fundamentals): Assesses how news aligns with a company’s fundamentals.
+perform_technical_analysis(ticker): Computes technical indicators (e.g., SMA, MACD, RSI).
+calculate_pivot_points(df): Determines pivot points for support and resistance levels.
+detect_unusual_options_activity(ticker): Identifies unusual options trading volume or patterns.
+trade.py
+Purpose: Evaluates trading opportunities and generates actionable strategies.
+
+Major Functions:
+
+evaluate_trade_opportunity(ticker, news_analysis=None): Assesses trade viability using technicals, options, and news sentiment.
+generate_trade_strategy(ticker, tech_analysis, options_activity, news_analysis, market_context, use_options=True): Creates a strategy with entry points, targets, and stop losses.
+generate_risk_reward_chart(ticker, strategy, run_timestamp): Produces a JSON file for risk/reward visualization.
+generate_trade_confidence(ticker, headline, analysis, tech_analysis): Rates confidence in a trade using an AI model.
+save_enhanced_recommendation(run_timestamp, headline, analysis, summary, trade_evaluation): Saves detailed trade recommendations as text files.
+summarize_technical_signals(trade_evaluation): Summarizes key technical signals.
+summarize_options_activity(trade_evaluation): Summarizes unusual options activity.
+backtest.py
+Purpose: Simulates and monitors trade performance over time.
+
+Major Functions:
+
+simulate_trade_performance(ticker, strategy, days_to_monitor=10): Starts a backtest record for a trade strategy.
+update_backtests(): Updates backtest records with current prices and checks for target/stop triggers.
+main.py
+Purpose: Serves as the entry point, coordinating the entire workflow.
+
+Major Functions:
+
+process_feed(processed_articles, daily_stats, run_timestamp): Fetches and filters recent RSS feed articles.
+process_batch(items, today_str, run_timestamp, processed_articles, daily_stats): Processes batches of headlines for analysis.
+process_ticker_analysis(ticker, headline, analysis, summary, run_timestamp): Handles ticker-specific analysis and trade evaluation.
+run_maintenance_tasks(): Updates watchlists, backtests, and checks market events.
+main(): Runs the system in a loop or as a single execution.
+How the System Works
+Setup:
+Loads configurations, initializes API clients, and sets up directories.
+Maintenance:
+Updates watchlist performance and backtest records; checks market events.
+News Fetching:
+Pulls recent articles from RSS feeds and filters out processed ones.
+Analysis:
+Classifies headlines, extracts tickers, and analyzes sentiment and impact.
+Trade Evaluation:
+Combines news analysis, technicals, and options data to assess trades.
+Generates strategies for high-confidence opportunities.
+Output:
+Saves recommendations if they meet the score threshold.
+Adds tickers to the watchlist.
+Backtesting:
+Simulates trade performance and updates results periodically.
+Execution:
+Runs continuously (every 5 minutes) or as a single pass.
+Usage
+Ensure dependencies are installed and environment variables are set. Run the system with:
+
+bash
+
+Collapse
+
+Wrap
+
+Copy
+python3 main.py
+For a single execution:
+
+bash
+
+Collapse
+
+Wrap
+
+Copy
+python3 main.py --single-run
+Dependencies
+feedparser: Parses RSS feeds.
+yfinance: Fetches stock and market data.
+talib: Calculates technical indicators.
+pandas: Handles data manipulation.
+numpy: Supports numerical operations.
+google.generativeai: Interfaces with Gemini API.
+anthropic: Interfaces with Claude API.
+openai: Optional for DeepSeek or other OpenAI-compatible APIs.
+Install with:
+
+bash
+
+Collapse
+
+Wrap
+
+Copy
+pip install feedparser yfinance TA-Lib pandas numpy google-generativeai anthropic openai
+Note: TA-Lib may require manual installation; see its documentation.
+
+Environment Variables
+Set these in your environment:
+
+GEMINI_API_KEY: Google Gemini API key.
+ANTHROPIC_API_KEY: Anthropic Claude API key.
+DEEPSEEK_API_KEY (optional): DeepSeek API key.
+Example:
+
+bash
+
+Collapse
+
+Wrap
+
+Copy
+export GEMINI_API_KEY='your_gemini_key'
+export ANTHROPIC_API_KEY='your_anthropic_key'
+export DEEPSEEK_API_KEY='your_deepseek_key'  # Optional
+Notes
+Modularity: Each file has a single responsibility, easing updates and debugging.
+Rate Limiting: Prevents API quota issues with per-minute and daily checks.
+Caching: Reduces redundant API calls for stock and options data.
+Error Handling: Includes retries and logging for robustness.
+Extensibility: Designed for easy addition of new features or models.
+This README provides a complete guide to understanding and using the trading system effectively.
+
+================
+File: trade.py
+================
+import os
+import json
+import datetime
+import re
+import yfinance as yf
+from api import robust_api_call
+from config import RECOMMENDATIONS_DIR, MIN_OVERALL_SCORE, ENABLE_BACKTESTING, logger
+from data import get_current_price, get_extended_market_context, get_stock_data
+from analysis import perform_technical_analysis, detect_unusual_options_activity
+from utils import add_to_watchlist
+from config import logger
+
+def evaluate_trade_opportunity(ticker, news_analysis=None):
+    """
+    Evaluates a trade opportunity for a given ticker based on technical analysis, options activity, and news.
+    
+    Args:
+        ticker (str): Stock ticker symbol.
+        news_analysis (dict, optional): Analysis of news including sentiment and confidence.
+    
+    Returns:
+        dict: Trade evaluation with scores, recommendation, and strategy if applicable.
+    """
+    results = {
+        'ticker': ticker,
+        'timestamp': datetime.datetime.now().isoformat(),
+        'factors': {},
+        'overall_score': 0,
+        'max_score': 10,
+        'recommendation': "No Trade"
+    }
+    
+    # Technical Analysis
+    tech_analysis = perform_technical_analysis(ticker)
+    if tech_analysis['technical_rating'] == "No Data":
+        results['factors']['technical'] = {'score': 0, 'rating': "No Data", 'details': tech_analysis}
+        return results
+    tech_score = min(5, (tech_analysis['technical_score'] / tech_analysis['max_score']) * 5)
+    results['factors']['technical'] = {'score': tech_score, 'rating': tech_analysis['technical_rating'], 'details': tech_analysis}
+    results['overall_score'] += tech_score
+    
+    # Options Activity
+    options_activity = detect_unusual_options_activity(ticker)
+    options_score = min(3, options_activity['unusual_score'] * 0.5)
+    results['factors']['options_activity'] = {'score': options_score, 'assessment': options_activity['assessment'], 'details': options_activity}
+    results['overall_score'] += options_score
+    
+    # News Analysis
+    if news_analysis:
+        news_confidence = news_analysis.get('confidence', 'low')
+        news_score = {'very-high': 2.0, 'high': 1.5, 'medium': 1.0, 'low': 0.5}.get(news_confidence.lower().replace(' ', '-'), 0)
+        # Adjust news score based on market cap (favor smaller companies)
+        stock_data = get_stock_data(ticker, get_cache_timestamp())
+        market_cap = stock_data.get('marketCap', 0) / 1e9  # Convert to billions
+        if market_cap > 0 and market_cap < 1:  # Small cap (< $1B)
+            news_score *= 1.5
+        elif market_cap < 10:  # Mid cap (< $10B)
+            news_score *= 1.2
+        results['factors']['news_catalyst'] = {
+            'score': news_score,
+            'confidence': news_confidence,
+            'catalyst': news_analysis.get('market_catalyst', 'Unknown'),
+            'sentiment': news_analysis.get('sentiment', 'Unknown'),
+            'details': news_analysis
+        }
+        results['overall_score'] += news_score
+    
+    # Market Context and Recommendation
+    results['market_context'] = get_extended_market_context()
+    results['recommendation'] = (
+        "Strong Buy" if results['overall_score'] >= 7 else
+        "Buy" if results['overall_score'] >= 5 else
+        "Watch" if results['overall_score'] >= 3 else
+        "No Trade"
+    )
+    
+    # Generate Strategy for Buy Recommendations
+    if results['recommendation'] in ["Strong Buy", "Buy"]:
+        use_options = options_score > 1.5 or (news_analysis and news_analysis.get('impact_timing') == 'immediate')
+        results['strategy'] = generate_trade_strategy(ticker, tech_analysis, options_activity, news_analysis, results['market_context'], use_options)
+    
+    return results
+
+def generate_trade_strategy(ticker, tech_analysis, options_activity, news_analysis, market_context, use_options=True):
+    """
+    Generates a trading strategy using an AI model based on technicals, options, news, and market context.
+    The model has full freedom to recommend the best strategy (or no trade), considering trader preferences as guidance.
+
+    Args:
+        ticker (str): Stock ticker symbol.
+        tech_analysis (dict): Technical analysis data.
+        options_activity (dict): Options activity data.
+        news_analysis (dict): News analysis data.
+        market_context (dict): Market context data.
+        use_options (bool): Preference for using options (default True, but model can override).
+
+    Returns:
+        dict: Trading strategy details or a "no trade" recommendation with explanation.
+    """
+    try:
+        # Fetch current price (assuming a helper function exists in your system)
+        current_price = get_current_price(ticker)
+        if current_price is None:
+            logger.error(f"No current price available for {ticker}")
+            return {"type": "error", "strategy": "No current price available"}
+
+        # Extract nearest support and resistance from technical analysis
+        support_resistance = tech_analysis.get('support_resistance', {})
+        supports = support_resistance.get('supports', [])
+        resistances = support_resistance.get('resistances', [])
+        nearest_support = min(supports, key=lambda x: abs(x - current_price)) if supports else current_price * 0.9
+        nearest_resistance = min(resistances, key=lambda x: abs(x - current_price)) if resistances else current_price * 1.1
+
+        # Summarize technical analysis concisely
+        tech_summary = f"Rating: {tech_analysis.get('technical_rating', 'Unknown')}, Score: {tech_analysis.get('technical_score', 0)}/{tech_analysis.get('max_score', 14)}"
+        daily_signals = tech_analysis.get('signals', {}).get('daily', {})
+        if daily_signals:
+            if daily_signals.get('price_above_sma50'): tech_summary += ", Price > 50-day MA"
+            if daily_signals.get('macd_bullish'): tech_summary += ", MACD Bullish"
+            rsi = daily_signals.get('rsi_value', 0)
+            if rsi > 70: tech_summary += ", RSI Overbought"
+            elif rsi < 30: tech_summary += ", RSI Oversold"
+
+        # Summarize options activity
+        options_summary = options_activity.get('assessment', 'No options data available')
+        if options_activity.get('unusual_activity'):
+            call_count = sum(1 for act in options_activity['unusual_activity'] if act['type'] == 'call')
+            put_count = sum(1 for act in options_activity['unusual_activity'] if act['type'] == 'put')
+            options_summary += f", {call_count} calls, {put_count} puts"
+
+        # Summarize news analysis
+        news_summary = "No news data" if not news_analysis else (
+            f"Sentiment: {news_analysis.get('sentiment', 'Unknown')} (Score: {news_analysis.get('sentiment_score', 'N/A')}), "
+            f"Impact: {news_analysis.get('price_impact_range', 'Unknown')}, "
+            f"Timing: {news_analysis.get('impact_timing', 'Unknown')}"
+        )
+
+        # Summarize market context
+        market_summary = (
+            f"Trend: {market_context.get('trend', 'Unknown')}, "
+            f"SPY: {market_context.get('spy_price', 'N/A')} ({market_context.get('spy_change_1d', 0):.1f}%), "
+            f"VIX: {market_context.get('vix', 0):.1f}"
+        )
+
+        # Construct the prompt for the AI model
+        prompt = f"""
+Act as an expert trading strategist. Use the following information to recommend the best trading strategy for {ticker}:
+
+Trader Preferences (consider these as guidance, not strict rules):
+- Prefers options for asymmetric risk-reward and shorter time frames.
+- Prefers lower cost of capital.
+- Uses puts instead of shorting stock.
+
+Current Price: ${current_price:.2f}
+
+Technical Analysis:
+- Support: ${nearest_support:.2f}
+- Resistance: ${nearest_resistance:.2f}
+- {tech_summary}
+
+Options Activity: {options_summary}
+
+News Analysis: {news_summary}
+
+Market Context: {market_summary}
+
+Analyze all this data and decide on the best trading strategy—or recommend no trade if conditions aren’t favorable. You may deviate from the trader’s preferences if justified (e.g., higher cost of capital for a compelling opportunity). 
+
+If recommending a trade, return a JSON object with:
+- 'strategy_type': e.g., 'bullish_options', 'bearish_stock'
+- 'entry': entry point or range (e.g., '$50-$51')
+- 'target': profit target (e.g., '$55')
+- 'stop_loss': stop loss level (e.g., '$48')
+- 'position_size': suggested size (e.g., '2% of portfolio')
+- 'options_details': specific options if applicable (e.g., 'Buy 1 $50 call expiring Dec 20')
+- 'risk_reward': estimated risk-reward ratio (e.g., 3.5)
+- 'market_aligned': true/false (aligns with market trend?)
+- 'explanation': why this strategy makes sense
+
+If no trade is recommended, return a JSON object with:
+- 'recommendation': 'No Trade'
+- 'explanation': why no trade is advised
+
+Return your response as a valid JSON object.
+"""
+
+        # Define advanced models to leverage their intelligence
+        models = ["claude-3-7-sonnet-20250219", "gemini-2.0-flash"]
+
+        # Make the API call
+        success, response = robust_api_call(models, prompt, config={'response_mime_type': 'application/json'}, max_tokens=4000)
+
+        if not success:
+            logger.error(f"API call failed for {ticker}: {response}")
+            return {"type": "error", "strategy": "Failed to generate strategy"}
+
+        # Parse the model’s JSON response
+        try:
+            strategy_data = json.loads(response)
+
+            if strategy_data.get('recommendation') == 'No Trade':
+                return {
+                    "type": "no_trade",
+                    "strategy": "No trade recommended",
+                    "position_size": "N/A",
+                    "entry": "N/A",
+                    "target": "N/A",
+                    "stop_loss": "N/A",
+                    "risk_reward": 0,
+                    "market_aligned": False,
+                    "explanation": strategy_data.get('explanation', 'No explanation provided')
+                }
+            else:
+                return {
+                    "type": strategy_data.get('strategy_type', 'unknown'),
+                    "strategy": f"{strategy_data.get('strategy_type', 'unknown').replace('_', ' ').title()}: {strategy_data.get('options_details', '')}",
+                    "position_size": strategy_data.get('position_size', 'N/A'),
+                    "entry": strategy_data.get('entry', 'N/A'),
+                    "target": strategy_data.get('target', 'N/A'),
+                    "stop_loss": strategy_data.get('stop_loss', 'N/A'),
+                    "risk_reward": float(strategy_data.get('risk_reward', 0)),
+                    "market_aligned": bool(strategy_data.get('market_aligned', False)),
+                    "explanation": strategy_data.get('explanation', 'No explanation provided')
+                }
+        except json.JSONDecodeError:
+            logger.error(f"Invalid JSON response for {ticker}: {response}")
+            return {"type": "error", "strategy": "Failed to parse strategy"}
+
+    except Exception as e:
+        logger.error(f"Error generating strategy for {ticker}: {e}")
+        return {"type": "error", "strategy": "Unable to generate strategy"}
+
+def generate_risk_reward_chart(ticker, strategy, run_timestamp):
+    """
+    Generates a risk/reward chart in JSON format based on the trade strategy.
+    
+    Args:
+        ticker (str): Stock ticker symbol.
+        strategy (dict): Trading strategy details.
+        run_timestamp (str): Timestamp of the run for file storage.
+    """
+    try:
+        entry = strategy.get('entry', '')
+        current_price_match = re.search(r'\$(\d+\.\d+)', entry)
+        if not current_price_match:
+            logger.warning(f"No valid entry price found for {ticker}")
+            return
+        current_price = float(current_price_match.group(1))
+        
+        target_match = re.search(r'\$(\d+\.\d+)', strategy.get('target', ''))
+        stop_match = re.search(r'\$(\d+\.\d+)', strategy.get('stop_loss', ''))
+        if not target_match or not stop_match:
+            logger.warning(f"Missing target or stop price for {ticker}")
+            return
+        
+        target_price = float(target_match.group(1))
+        stop_price = float(stop_match.group(1))
+        
+        potential_gain = abs(target_price - current_price) / current_price * 100
+        potential_loss = abs(stop_price - current_price) / current_price * 100
+        risk_reward = potential_gain / potential_loss if potential_loss > 0 else 0
+        
+        chart_data = {
+            'ticker': ticker,
+            'current_price': current_price,
+            'target_price': target_price,
+            'stop_price': stop_price,
+            'potential_gain_pct': potential_gain,
+            'potential_loss_pct': potential_loss,
+            'risk_reward_ratio': risk_reward,
+            'strategy_type': strategy.get('type', 'unknown')
+        }
+        
+        os.makedirs(os.path.join(RECOMMENDATIONS_DIR, run_timestamp), exist_ok=True)
+        chart_file = os.path.join(RECOMMENDATIONS_DIR, run_timestamp, f"{ticker}_risk_reward.json")
+        with open(chart_file, "w") as f:
+            json.dump(chart_data, f, indent=4)
+            
+    except Exception as e:
+        logger.error(f"Error generating risk/reward chart for {ticker}: {e}")
+
+def generate_trade_confidence(ticker, headline, analysis, tech_analysis):
+    """
+    Generates a confidence score for the trade using an API call to a thinking model.
+    
+    Args:
+        ticker (str): Stock ticker symbol.
+        headline (str): News headline.
+        analysis (dict): News analysis data.
+        tech_analysis (dict): Technical analysis data.
+    
+    Returns:
+        dict: Confidence score and reasoning.
+    """
+    try:
+        prompt = (
+            f"Act as a professional hedge fund manager evaluating this trade idea. "
+            f"Based on the news and technical analysis, rate your confidence in this trade from 0-10 "
+            f"and explain your reasoning in 2-3 sentences.\n\n"
+            f"Ticker: {ticker}\n"
+            f"Headline: {headline}\n"
+            f"Analysis: {analysis.get('analysis', '')}\n"
+            f"Technical Rating: {tech_analysis.get('technical_rating', 'Unknown')}\n"
+            f"Key Signals: {tech_analysis.get('technical_score', 0)} out of {tech_analysis.get('max_score', 14)} points\n\n"
+            f"Return a JSON object with 'confidence_score' (number from 0 to 10) and 'reasoning' (string)."
+        )
+        THINKING_MODELS = [
+            "deepseek-reasoner",
+            "gemini-2.0-flash-thinking-exp-01-21",
+            "claude-3-7-sonnet-20250219"
+        ]
+        config = {'response_mime_type': 'application/json'} if "gemini" in THINKING_MODELS[0] else None
+        success, response = robust_api_call(THINKING_MODELS, prompt, config, max_tokens=4000, retries=2)
+        if success and 'confidence_score' in response and 'reasoning' in response:
+            return response
+        logger.error("All thinking models failed for generate_trade_confidence")
+        return {'confidence_score': 5, 'reasoning': "Unable to generate confidence assessment"}
+    except Exception as e:
+        logger.error(f"Error in trade confidence generation: {e}")
+        return {'confidence_score': 5, 'reasoning': "Error in analysis"}
+
+def save_enhanced_recommendation(run_timestamp, headline, analysis, summary, trade_evaluation):
+    """
+    Saves an enhanced trade recommendation to files.
+    
+    Args:
+        run_timestamp (str): Timestamp of the run.
+        headline (str): News headline.
+        analysis (dict): News analysis data.
+        summary (str): Summary of the trade (unused here but kept for compatibility).
+        trade_evaluation (dict): Trade evaluation data.
+    """
+    try:
+        ticker = trade_evaluation.get('ticker', 'unknown')
+        score = trade_evaluation.get('overall_score', 0)
+        recommendation = trade_evaluation.get('recommendation', 'No Trade')
+        if score < MIN_OVERALL_SCORE:
+            logger.info(f"Skipping low-score ({score:.1f}) recommendation for {ticker}: {headline}")
+            return
+        
+        run_dir = os.path.join(RECOMMENDATIONS_DIR, run_timestamp)
+        ticker_dir = os.path.join(RECOMMENDATIONS_DIR, "by_ticker")
+        os.makedirs(run_dir, exist_ok=True)
+        os.makedirs(ticker_dir, exist_ok=True)
+        
+        filename = os.path.join(run_dir, f"{ticker}_{recommendation.lower().replace(' ', '_')}.txt")
+        ticker_file = os.path.join(ticker_dir, f"{ticker}.txt")
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        trade_confidence = trade_evaluation.get('trade_confidence', {})
+        confidence_text = f"""
+TRADE CONFIDENCE:
+- Score: {trade_confidence.get('confidence_score', 'N/A')}/10
+- Assessment: {trade_confidence.get('reasoning', 'No assessment available')}
+"""
+        strategy = trade_evaluation.get('strategy', {})
+        strategy_text = f"""
+TRADE STRATEGY:
+- Type: {strategy.get('type', 'Unknown')}
+- Strategy: {strategy.get('strategy', 'No strategy available')}
+- Position Size: {strategy.get('position_size', 'Unknown')}
+- Entry: {strategy.get('entry', 'Unknown')}
+- Target: {strategy.get('target', 'Unknown')}
+- Stop Loss: {strategy.get('stop_loss', 'Unknown')}
+- Risk/Reward Ratio: {strategy.get('risk_reward', 0):.2f}
+- Market Aligned: {'Yes' if strategy.get('market_aligned', False) else 'No'}
+"""
+        recommendation_text = f"""
+=================================================================
+TRADE RECOMMENDATION: {ticker} - {recommendation} (Score: {score:.1f}/10)
+=================================================================
+Date: {timestamp}
+Headline: {headline}
+
+NEWS ANALYSIS:
+- Catalyst: {analysis.get('market_catalyst', 'Unknown')}
+- Sentiment: {analysis.get('sentiment', 'Unknown')} (Score: {analysis.get('sentiment_score', 'N/A')})
+- Expected Impact: {analysis.get('price_impact_range', 'Unknown')}
+- Timing: {analysis.get('impact_timing', 'Unknown')}
+- Sell The News: {'Yes' if analysis.get('sell_the_news', False) else 'No'}
+- Analysis: {analysis.get('analysis', 'No analysis available')}
+
+TECHNICAL ANALYSIS:
+- Rating: {trade_evaluation.get('factors', {}).get('technical', {}).get('rating', 'Unknown')}
+- Key Signals: {summarize_technical_signals(trade_evaluation)}
+
+OPTIONS ACTIVITY:
+- Assessment: {trade_evaluation.get('factors', {}).get('options_activity', {}).get('assessment', 'Unknown')}
+- Unusual Activity: {summarize_options_activity(trade_evaluation)}
+
+MARKET CONTEXT:
+- Market Trend: {trade_evaluation.get('market_context', {}).get('trend', 'Unknown')}
+- SPY: ${trade_evaluation.get('market_context', {}).get('spy_price', 0):.2f} ({trade_evaluation.get('market_context', {}).get('spy_change_1d', 0):.1f}%)
+- VIX: {trade_evaluation.get('market_context', {}).get('vix', 0):.1f} ({trade_evaluation.get('market_context', {}).get('volatility', 'Unknown')})
+{confidence_text}
+{strategy_text}
+
+=================================================================
+"""
+        with open(filename, "w") as f:
+            f.write(recommendation_text)
+        with open(ticker_file, "a") as f:
+            f.write(recommendation_text)
+        
+        add_to_watchlist(
+            ticker,
+            headline,
+            analysis.get('price_impact_range', 'Unknown'),
+            analysis.get('impact_timing', 'Unknown'),
+            score
+        )
+        if 'strategy' in trade_evaluation:
+            generate_risk_reward_chart(ticker, strategy, run_timestamp)
+        logger.info(f"Saved enhanced recommendation for {ticker}: {recommendation} (Score: {score:.1f}/10)")
+    except Exception as e:
+        logger.error(f"Error saving enhanced recommendation: {e}")
+
+def summarize_technical_signals(trade_evaluation):
+    """
+    Summarizes key technical signals from the trade evaluation.
+    
+    Args:
+        trade_evaluation (dict): Trade evaluation data.
+    
+    Returns:
+        str: Summary of technical signals.
+    """
+    try:
+        daily_signals = trade_evaluation.get('factors', {}).get('technical', {}).get('details', {}).get('signals', {}).get('daily', {})
+        if not daily_signals:
+            return "No technical signals available"
+        key_signals = []
+        if daily_signals.get('price_above_sma20'): key_signals.append("Price above 20-day MA")
+        if daily_signals.get('price_above_sma50'): key_signals.append("Price above 50-day MA")
+        if daily_signals.get('price_above_sma200'): key_signals.append("Price above 200-day MA")
+        if daily_signals.get('sma50_above_sma200'): key_signals.append("SMA50 above SMA200 (Golden Cross)")
+        if daily_signals.get('roc_positive'): key_signals.append(f"Positive ROC ({daily_signals.get('roc', 0):.2f})")
+        if daily_signals.get('macd_bullish_crossover'): key_signals.append("Bullish MACD crossover")
+        if daily_signals.get('rsi_value', 0) > 70: key_signals.append(f"RSI overbought ({daily_signals.get('rsi_value', 0):.1f})")
+        elif daily_signals.get('rsi_value', 0) < 30: key_signals.append(f"RSI oversold ({daily_signals.get('rsi_value', 0):.1f})")
+        if daily_signals.get('obv_increasing'): key_signals.append("Rising on-balance volume")
+        if daily_signals.get('bb_breakout_up'): key_signals.append("Bollinger Band bullish breakout")
+        return ", ".join(key_signals) or "No significant technical signals detected"
+    except Exception as e:
+        logger.error(f"Error summarizing technical signals: {e}")
+        return "Error processing technical signals"
+
+def summarize_options_activity(trade_evaluation):
+    """
+    Summarizes options activity from the trade evaluation.
+    
+    Args:
+        trade_evaluation (dict): Trade evaluation data.
+    
+    Returns:
+        str: Summary of options activity.
+    """
+    try:
+        options_details = trade_evaluation.get('factors', {}).get('options_activity', {}).get('details', {})
+        unusual_activity = options_details.get('unusual_activity', [])
+        if not unusual_activity:
+            return "No unusual options activity detected"
+        call_count = sum(1 for act in unusual_activity if act.get('type') == 'call')
+        put_count = sum(1 for act in unusual_activity if act.get('type') == 'put')
+        highest_volume = max(unusual_activity, key=lambda x: x.get('volume', 0), default=None)
+        highest_vol_desc = f"{highest_volume['type'].upper()} {highest_volume['strike']} exp {highest_volume['expiration']} (Vol: {highest_volume['volume']})" if highest_volume else "None"
+        return f"{call_count} bullish / {put_count} bearish signals. Highest volume: {highest_vol_desc}"
+    except Exception as e:
+        logger.error(f"Error summarizing options activity: {e}")
+        return "Error processing options activity"
+
+def get_cache_timestamp():
+    """
+    Returns a timestamp for caching purposes (hourly granularity).
+    
+    Returns:
+        int: Unix timestamp divided by 3600 (hours).
+    """
+    return int(datetime.datetime.now().timestamp() // 3600)
+
+================
+File: utils.py
+================
+import json
+import os
+import datetime
+from config import PROCESSED_FILE, STATS_FILE, WATCHLIST_FILE, logger
+
+def load_processed_articles():
+    if os.path.exists(PROCESSED_FILE):
+        try:
+            with open(PROCESSED_FILE, "r") as f:
+                return set(json.load(f))
+        except (json.JSONDecodeError, IOError) as e:
+            logger.error(f"Error loading processed articles: {e}")
+            return set()
+    return set()
+
+def save_processed_articles(processed_articles):
+    try:
+        with open(PROCESSED_FILE, "w") as f:
+            json.dump(list(processed_articles), f)
+    except IOError as e:
+        logger.error(f"Error saving processed articles: {e}")
+
+def load_daily_stats():
+    if os.path.exists(STATS_FILE):
+        try:
+            with open(STATS_FILE, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            logger.error(f"Error loading daily stats: {e}")
+            return {}
+    return {}
+
+def save_daily_stats(daily_stats):
+    try:
+        with open(STATS_FILE, "w") as f:
+            json.dump(daily_stats, f, indent=4)
+    except IOError as e:
+        logger.error(f"Error saving daily stats: {e}")
+
+def load_watchlist():
+    if os.path.exists(WATCHLIST_FILE):
+        try:
+            with open(WATCHLIST_FILE, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            logger.error(f"Error loading watchlist: {e}")
+            return {}
+    return {}
+
+def save_watchlist(watchlist):
+    try:
+        with open(WATCHLIST_FILE, "w") as f:
+            json.dump(watchlist, f, indent=4)
+    except IOError as e:
+        logger.error(f"Failed to save watchlist: {e}")
+
+def add_to_watchlist(ticker, reason, expected_impact, timeframe, score=None, get_current_price_func=None):
+    from data import get_current_price
+    watchlist = load_watchlist()
+    today = datetime.date.today().isoformat()
+    price = get_current_price(ticker) if get_current_price_func is None else get_current_price_func(ticker)
+    if price is None or price <= 0:
+        logger.error(f"Cannot add {ticker} to watchlist: unable to fetch valid price")
+        return
+    if ticker not in watchlist:
+        watchlist[ticker] = []
+    watchlist[ticker].append({
+        "date_added": today,
+        "reason": reason,
+        "expected_impact": expected_impact,
+        "timeframe": timeframe,
+        "score": score,
+        "status": "watching",
+        "price_at_entry": price
+    })
+    save_watchlist(watchlist)
+    logger.info(f"Added {ticker} to watchlist: {reason} (Score: {score})")
+
+def update_watchlist_performance(get_current_price_func=None):
+    from data import get_current_price
+    watchlist = load_watchlist()
+    updated = False
+    for ticker, entries in watchlist.items():
+        current_price = get_current_price(ticker) if get_current_price_func is None else get_current_price_func(ticker)
+        if current_price is None or current_price <= 0:
+            logger.warning(f"Skipping performance update for {ticker}: no valid current price")
+            continue
+        for entry in entries:
+            if entry["status"] == "watching" and "price_at_entry" in entry:
+                entry_price = entry["price_at_entry"]
+                if entry_price is None or entry_price <= 0:
+                    logger.warning(f"Invalid entry price for {ticker}: {entry_price}")
+                    continue
+                try:
+                    percent_change = ((current_price - entry_price) / entry_price) * 100
+                    entry["current_performance"] = percent_change
+                    updated = True
+                    entry_date = datetime.date.fromisoformat(entry["date_added"])
+                    days_passed = (datetime.date.today() - entry_date).days
+                    if days_passed > 5:
+                        entry["status"] = "closed"
+                        entry["final_performance"] = percent_change
+                        entry["close_reason"] = "time_elapsed"
+                        entry["close_date"] = datetime.date.today().isoformat()
+                        logger.info(f"Auto-closed watchlist item for {ticker}: {percent_change:.2f}% after {days_passed} days")
+                except ZeroDivisionError:
+                    logger.warning(f"Zero division error for {ticker}: entry_price is zero")
+                    continue
+    if updated:
+        save_watchlist(watchlist)
+        logger.info("Updated watchlist performance metrics")
+
+def is_recent(entry):
+    """
+    Check if an RSS feed entry is recent (within the last 48 hours).
+    Handles various date formats and skips if date cannot be parsed.
+    """
+    logger.debug(f"Checking recency for entry: {entry.get('title', 'Unknown')}")
+    date_fields = ['published_parsed', 'updated_parsed', 'pubDate']
+    for field in date_fields:
+        if field in entry:
+            try:
+                if field == 'pubDate':
+                    from email.utils import parsedate_to_datetime
+                    try:
+                        publish_time = parsedate_to_datetime(entry[field])
+                    except (ValueError, TypeError):
+                        date_str = entry[field]
+                        if 'UT' in date_str:
+                            date_str = date_str.replace('UT', 'GMT')
+                        formats = [
+                            '%a, %d %b %Y %H:%M:%S %Z',
+                            '%a, %d %b %Y %H:%M:%S %z',
+                            '%Y-%m-%dT%H:%M:%S%z',
+                            '%Y-%m-%d %H:%M:%S'
+                        ]
+                        for fmt in formats:
+                            try:
+                                publish_time = datetime.datetime.strptime(date_str, fmt)
+                                break
+                            except ValueError:
+                                continue
+                        else:
+                            logger.warning(f"Could not parse date: {date_str}")
+                            return False  # Skip if unparsable
+                else:
+                    publish_time = datetime.datetime(*entry[field][:6])
+                age_seconds = (datetime.datetime.now() - publish_time.replace(tzinfo=None)).total_seconds()
+                if age_seconds < 0:
+                    logger.warning(f"Entry in future: {entry.get('title', 'Unknown')}")
+                    return True
+                logger.debug(f"Entry age: {age_seconds/3600:.1f} hours")
+                return age_seconds <= 172800  # 48 hours
+            except Exception as e:
+                logger.warning(f"Error parsing date for {field}: {e}")
+    logger.info(f"No valid date found for: {entry.get('title', 'Unknown')}, skipping")
+    return False
+
+
+
+================================================================
+End of Codebase
+================================================================
